@@ -139,9 +139,43 @@ class WebRtcClient(
     }
 
     private fun createPeerConnection(callId: String, isCaller: Boolean, withVideo: Boolean): PeerConnection {
-        val iceServers = listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
+        // === CẤU HÌNH LIST SERVER (STUN + TURN OPENRELAY) ===
+        val iceServers = ArrayList<PeerConnection.IceServer>()
+
+        // 1. Google STUN (Giữ lại để tìm IP Public nhanh)
+       // iceServers.add(
+      //      PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
+      //  )
+
+        // 2. OpenRelay TURN (QUAN TRỌNG: Để xuyên tường lửa 4G/Wifi công ty)
+        // Username/Password này là công khai của dự án OpenRelay
+        val turnUser = "openrelayproject"
+        val turnPass = "openrelayproject"
+
+        // Thêm Port 80 (UDP)
+        iceServers.add(
+            PeerConnection.IceServer.builder("turn:openrelay.metered.ca:80")
+                .setUsername(turnUser)
+                .setPassword(turnPass)
+                .createIceServer()
         )
+
+        // Thêm Port 443 (UDP) - Hữu ích khi port 80 bị chặn
+        iceServers.add(
+            PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443")
+                .setUsername(turnUser)
+                .setPassword(turnPass)
+                .createIceServer()
+        )
+
+        // Thêm Port 443 (TCP) - Dự phòng cuối cùng nếu UDP bị chặn hoàn toàn
+        iceServers.add(
+            PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443?transport=tcp")
+                .setUsername(turnUser)
+                .setPassword(turnPass)
+                .createIceServer()
+        )
+        // ==========================================================
 
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN

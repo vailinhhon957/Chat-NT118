@@ -1,5 +1,6 @@
 package com.example.chat_compose.data
 
+import android.graphics.BitmapFactory
 import com.example.chat_compose.model.Message
 import com.google.firebase.Firebase
 import com.google.firebase.vertexai.type.content
@@ -8,57 +9,69 @@ import com.google.firebase.vertexai.vertexAI
 
 class GeminiAiRepository {
 
-    // 1. Khởi tạo model từ Firebase.vertexAI
+    // Model multimodal (Text + Image + Audio)
     private val model = Firebase.vertexAI.generativeModel(
-        // 2. Sử dụng tên model chính xác hiện tại
         modelName = "gemini-2.5-flash",
-
         generationConfig = generationConfig {
             temperature = 0.4f
             maxOutputTokens = 1024
         },
-        // 3. System Instruction giúp định hình tính cách AI
         systemInstruction = content {
             text(
                 """
-                Bạn là trợ lý AI trong ứng dụng chat.
-                Trả lời ngắn gọn, đúng trọng tâm, tiếng Việt.
-                Nếu thiếu dữ kiện thì hỏi lại 1 câu ngắn.
+                Bạn là trợ lý AI thông minh tên là HuyAn AI.
+                - Trả lời ngắn gọn, thân thiện, dùng tiếng Việt.
+                - Nếu là ảnh: mô tả hoặc trả lời câu hỏi về ảnh.
+                - Nếu là âm thanh: tóm tắt hoặc trả lời nội dung âm thanh.
                 """.trimIndent()
             )
         }
     )
 
     /**
-     * history: danh sách message cũ để AI hiểu ngữ cảnh
-     * userText: câu hỏi mới của user
+     * Trả lời hỗ trợ Text + Ảnh + Audio
      */
-    suspend fun reply(history: List<Message>, userText: String): String {
-        // 4. Chuyển đổi List<Message> của app thành List<Content> của Gemini
-        val histContents = history
-            .takeLast(20) // Chỉ lấy 20 tin gần nhất để tiết kiệm token
-            .mapNotNull { m ->
-                val t = m.text.trim()
-                if (t.isBlank()) return@mapNotNull null
-
-                // QUAN TRỌNG: Cần khớp ID này với ID bạn gán cho Bot trong code ChatViewModel/Repository
-                // Ví dụ: trong ChatRepository bạn quy định botId là "AI_BOT"
-                val role = if (m.fromId == "AI_BOT") "model" else "user"
-
-                content(role = role) { text(t) }
-            }
+    suspend fun replyWithMedia(
+        history: List<Message>,
+        userText: String,
+        imageBytes: ByteArray? = null,
+        audioBytes: ByteArray? = null
+    ): String {
+        // Convert history to Vertex AI contents (text-only) to avoid token waste
+        val histContents = history.takeLast(10).mapNotNull { m ->
+            val t = m.text.trim()
+            if (t.isBlank()) return@mapNotNull null
+            val role = if (m.fromId == ChatRepository.AI_BOT_ID) "model" else "user"
+            content(role = role) { text(t) }
+        }
 
         return try {
-            // 5. Bắt đầu phiên chat với lịch sử
             val chat = model.startChat(history = histContents)
 
-            // 6. Gửi tin nhắn mới và đợi phản hồi
-            val response = chat.sendMessage(userText)
+            val inputContent = content {
+                if (userText.isNotBlank()) text(userText)
+                else if (imageBytes == null && audioBytes == null) text("Phân tích nội dung này giúp tôi.")
 
-            response.text?.trim() ?: "Xin lỗi, tôi không thể trả lời lúc này."
+                if (imageBytes != null) {
+                    val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                    if (bitmap != null) image(bitmap)
+                }
+
+                if (audioBytes != null) {
+                    // Firebase VertexAI inlineData signature: inlineData(data, mimeType)
+                    inlineData(audioBytes, "audio/mp3")
+                }
+            }
+
+            val response = chat.sendMessage(inputContent)
+            response.text?.trim() ?: "Em nghe/nhìn nhưng chưa hiểu lắm..."
         } catch (e: Exception) {
             e.printStackTrace()
-            "Lỗi kết nối AI: ${e.localizedMessage}"
+            "Lỗi xử lý đa phương tiện: ${e.localizedMessage}"
         }
+    }
+
+    suspend fun reply(history: List<Message>, userText: String): String {
+        return replyWithMedia(history, userText, null, null)
     }
 }

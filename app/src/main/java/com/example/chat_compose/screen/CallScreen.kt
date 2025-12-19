@@ -1,7 +1,12 @@
 package com.example.chat_compose.screen
 
 import android.Manifest
-import android.graphics.BitmapFactory
+import android.content.Intent
+import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
+import android.view.PixelCopy
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
@@ -18,7 +23,6 @@ import androidx.compose.material.icons.rounded.CallEnd
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MicOff
 import androidx.compose.material.icons.rounded.Videocam
-import androidx.compose.material.icons.rounded.VideocamOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,14 +33,21 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.chat_compose.MainActivity
+import com.example.chat_compose.call.SensitiveContentDetector
 import com.example.chat_compose.call.WebRtcClient
 import com.example.chat_compose.data.CallRepository
+import com.google.firebase.auth.FirebaseAuth
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
+import kotlin.coroutines.resume
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -48,41 +59,36 @@ fun CallScreen(
     callType: String, // "audio" | "video"
     onBack: () -> Unit
 ) {
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
     val repo = remember { CallRepository() }
     val scope = rememberCoroutineScope()
 
-    // State hiển thị tên thật và avatar
+    // --- State UI ---
     var realName by remember { mutableStateOf(if (partnerName.isNotBlank()) partnerName else "Đang kết nối...") }
     var avatarBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var status by remember { mutableStateOf("ringing") } // ringing | accepted | ended
+    var startedWebRtc by remember { mutableStateOf(false) }
+    var isMicOn by remember { mutableStateOf(true) }
 
-    // Load thông tin User
+    // --- WebRTC ---
+    val webRtc = remember(callId) { WebRtcClient(context, repo, scope) }
+    val withVideo = callType == "video"
+    val eglCtx = remember(callId, withVideo) { if (withVideo) webRtc.ensureEglContext() else null }
+    var localRenderer by remember(callId) { mutableStateOf<SurfaceViewRenderer?>(null) }
+    var remoteRenderer by remember(callId) { mutableStateOf<SurfaceViewRenderer?>(null) }
+
+    // --- AI Detector ---
+    val sensitiveDetector = remember { SensitiveContentDetector() }
+    var aiCheckTicker by remember { mutableLongStateOf(0L) }
+
+    // --- Logic Load Info ---
     LaunchedEffect(partnerId) {
         val profile = repo.getUserProfile(partnerId)
-        if (profile.displayName.isNotBlank()) {
-            realName = profile.displayName
-        }
+        if (profile.displayName.isNotBlank()) realName = profile.displayName
         avatarBytes = profile.avatarBytes
     }
 
-    var status by remember { mutableStateOf("ringing") } // ringing | accepted | ended
-    var startedWebRtc by remember { mutableStateOf(false) }
-
-    // Tránh popBackStack nhiều lần
-    var didGoBack by remember { mutableStateOf(false) }
-    val goBackOnce: () -> Unit = {
-        if (!didGoBack) {
-            didGoBack = true
-            onBack()
-        }
-    }
-
-    // WebRTC client
-    val webRtc = remember(callId) {
-        WebRtcClient(context, repo, scope)
-    }
-
-    // Permissions logic
+    // --- Logic Permissions ---
     var pendingAccept by remember { mutableStateOf(false) }
     val requiredPerms = remember(callType) {
         if (callType == "video") arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
@@ -99,50 +105,91 @@ fun CallScreen(
             scope.launch {
                 repo.acceptCall(callId)
                 startedWebRtc = true
-                runCatching { webRtc.startCallee(callId, callType == "video") }
+                runCatching { webRtc.startCallee(callId, withVideo) }
             }
         }
     }
 
-    // Video/Audio toggle states
-    var isMicOn by remember { mutableStateOf(true) }
-    // Video toggle đã bỏ cho Audio Call
-
-    // Video Renderers
-    val withVideo = callType == "video"
-    val eglCtx = remember(callId, withVideo) { if (withVideo) webRtc.ensureEglContext() else null }
-    var localRenderer by remember(callId) { mutableStateOf<SurfaceViewRenderer?>(null) }
-    var remoteRenderer by remember(callId) { mutableStateOf<SurfaceViewRenderer?>(null) }
-
+    // --- Logic WebRTC Setup ---
     LaunchedEffect(localRenderer, remoteRenderer) {
         if (withVideo) webRtc.setVideoRenderers(localRenderer, remoteRenderer)
     }
 
-    // Listen call status
     LaunchedEffect(callId) {
         repo.listenCallDoc(callId).collect { data ->
             val s = data["status"] as? String ?: return@collect
             status = s
             if (s == "ended") {
                 runCatching { webRtc.stop() }
-                goBackOnce()
+                onBack()
             }
         }
     }
 
-    // Start WebRTC logic
     LaunchedEffect(status, permsGranted) {
         if (!permsGranted) return@LaunchedEffect
         if (startedWebRtc) return@LaunchedEffect
-
         if (isCaller && status == "accepted") {
             startedWebRtc = true
-            // Đảm bảo startCaller nhận đúng tham số
-            runCatching { webRtc.startCaller(callId, callType == "video") }
+            runCatching { webRtc.startCaller(callId, withVideo) }
         }
     }
 
-    // Cleanup
+    // ==========================================================
+    // LOGIC AI: CHECK NHẠY CẢM MỖI 5 GIÂY (CHỈ KHI VIDEO CALL)
+    // ==========================================================
+    if (status == "accepted" && withVideo) {
+        // 1. Timer loop
+        LaunchedEffect(Unit) {
+            while (true) {
+                delay(5000) // 5 giây check 1 lần
+                aiCheckTicker++
+            }
+        }
+
+        // 2. AI Processing
+        LaunchedEffect(aiCheckTicker) {
+            if (aiCheckTicker > 0 && localRenderer != null) {
+                try {
+                    val bitmap = captureBitmapFromSurface(localRenderer!!)
+                    if (bitmap != null) {
+                        val isSensitive = sensitiveDetector.isSensitive(bitmap)
+
+                        if (isSensitive) {
+                            // Gọi repo để báo cáo. Hàm này (trong CallRepository) sẽ tính toán
+                            // nếu vi phạm >= 3 lần thì set lockedUntil = now + 30 ngày
+                            val isLocked = repo.reportSensitiveContent()
+
+                            if (isLocked) {
+                                // === XỬ LÝ KHÓA TÀI KHOẢN 30 NGÀY ===
+                                Toast.makeText(context, "BẠN ĐÃ BỊ KHÓA TÀI KHOẢN 30 NGÀY DO VI PHẠM!", Toast.LENGTH_LONG).show()
+
+                                // 1. Ngắt cuộc gọi
+                                repo.endCall(callId)
+
+                                // 2. Đăng xuất khỏi Firebase (Chặn token)
+                                FirebaseAuth.getInstance().signOut()
+
+                                // 3. Restart App về màn hình Login
+                                val intent = Intent(context, MainActivity::class.java).apply {
+                                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                                }
+                                context.startActivity(intent)
+
+                            } else {
+                                // Cảnh cáo
+                                Toast.makeText(context, "CẢNH BÁO: Hình ảnh nhạy cảm! (Vi phạm 3 lần sẽ bị khóa 30 ngày)", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    // --- Cleanup ---
     DisposableEffect(Unit) {
         onDispose {
             runCatching { webRtc.clearVideoRenderers() }
@@ -158,15 +205,11 @@ fun CallScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF1F1C2C), Color(0xFF928DAB))
-                )
-            )
+            .background(Brush.verticalGradient(listOf(Color(0xFF1F1C2C), Color(0xFF928DAB))))
             .systemBarsPadding()
     ) {
 
-        // ====== 1. GIAO DIỆN VIDEO CALL (KHI ĐÃ ACCEPT) ======
+        // ====== 1. VIDEO UI ======
         if (withVideo && status == "accepted") {
             Box(Modifier.fillMaxSize()) {
                 // Remote Video
@@ -207,7 +250,7 @@ fun CallScreen(
                     )
                 }
 
-                // Controls Bottom Overlay (Video Call)
+                // Controls
                 Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -225,7 +268,6 @@ fun CallScreen(
                         horizontalArrangement = Arrangement.spacedBy(32.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Toggle Mic
                         ControlButton(
                             icon = if (isMicOn) Icons.Rounded.Mic else Icons.Rounded.MicOff,
                             color = if (isMicOn) Color.White.copy(0.2f) else Color.White,
@@ -235,105 +277,79 @@ fun CallScreen(
                             webRtc.toggleAudio(isMicOn)
                         }
 
-                        // End Call
                         ControlButton(
                             icon = Icons.Rounded.CallEnd,
                             color = Color(0xFFFF3B30),
                             size = 72.dp
                         ) {
-                            scope.launch { repo.endCall(callId); goBackOnce() }
+                            scope.launch { repo.endCall(callId); onBack() }
                         }
                     }
                 }
             }
-            return@Box
         }
 
-        // ====== 2. GIAO DIỆN ĐANG ĐỔ CHUÔNG / AUDIO CALL ======
-        Column(
-            modifier = Modifier.fillMaxSize(),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Spacer(Modifier.height(80.dp))
-
-            Box(contentAlignment = Alignment.Center) {
-                if (status == "ringing") {
-                    PulseAnimation()
-                }
-                CallAvatar(realName, avatarBytes, 120.dp)
-            }
-
-            Spacer(Modifier.height(24.dp))
-
-            Text(
-                text = realName,
-                style = MaterialTheme.typography.headlineMedium,
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
-
-            Spacer(Modifier.height(8.dp))
-
-            Text(
-                text = when (status) {
-                    "ringing" -> if (isCaller) "Đang gọi..." else "Cuộc gọi đến..."
-                    "accepted" -> "Đang đàm thoại..."
-                    "ended" -> "Cuộc gọi kết thúc"
-                    else -> "Đang kết nối..."
-                },
-                style = MaterialTheme.typography.bodyLarge,
-                color = Color.White.copy(alpha = 0.7f)
-            )
-
-            Spacer(Modifier.weight(1f))
-
-            if (!permsGranted) {
-                Button(
-                    onClick = { permLauncher.launch(requiredPerms) },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(0.2f))
-                ) { Text("Cấp quyền truy cập") }
-                Spacer(Modifier.height(20.dp))
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 60.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
+        // ====== 2. AUDIO / RINGING UI ======
+        else {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                when (status) {
-                    "ringing" -> {
+                Spacer(Modifier.height(80.dp))
+
+                Box(contentAlignment = Alignment.Center) {
+                    if (status == "ringing") PulseAnimation()
+                    CallAvatar(realName, avatarBytes, 120.dp)
+                }
+
+                Spacer(Modifier.height(24.dp))
+                Text(text = realName, style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = when (status) {
+                        "ringing" -> if (isCaller) "Đang gọi..." else "Cuộc gọi đến..."
+                        "accepted" -> "Đang đàm thoại..."
+                        else -> "Kết thúc"
+                    },
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = Color.White.copy(alpha = 0.7f)
+                )
+
+                Spacer(Modifier.weight(1f))
+
+                if (!permsGranted) {
+                    Button(
+                        onClick = { permLauncher.launch(requiredPerms) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(0.2f))
+                    ) { Text("Cấp quyền truy cập") }
+                    Spacer(Modifier.height(20.dp))
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 60.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (status == "ringing") {
                         if (isCaller) {
-                            // Người gọi: Nút Kết thúc
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                ControlButton(
-                                    icon = Icons.Rounded.CallEnd,
-                                    color = Color(0xFFFF3B30),
-                                    size = 72.dp
-                                ) {
-                                    scope.launch { repo.endCall(callId); goBackOnce() }
+                                ControlButton(icon = Icons.Rounded.CallEnd, color = Color(0xFFFF3B30), size = 72.dp) {
+                                    scope.launch { repo.endCall(callId); onBack() }
                                 }
                                 Spacer(Modifier.height(8.dp))
                                 Text("Kết thúc", color = Color.White.copy(0.8f))
                             }
                         } else {
-                            // Người nhận: Từ chối & Trả lời
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                ControlButton(
-                                    icon = Icons.Rounded.CallEnd,
-                                    color = Color(0xFFFF3B30),
-                                    size = 72.dp
-                                ) {
-                                    scope.launch { repo.rejectCall(callId); goBackOnce() }
+                                ControlButton(icon = Icons.Rounded.CallEnd, color = Color(0xFFFF3B30), size = 72.dp) {
+                                    scope.launch { repo.rejectCall(callId); onBack() }
                                 }
                                 Spacer(Modifier.height(8.dp))
                                 Text("Từ chối", color = Color.White.copy(0.8f))
                             }
-
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 ControlButton(
-                                    icon = if (callType == "video") Icons.Rounded.Videocam else Icons.Rounded.Call,
+                                    icon = if (withVideo) Icons.Rounded.Videocam else Icons.Rounded.Call,
                                     color = Color(0xFF34C759),
                                     size = 72.dp
                                 ) {
@@ -344,7 +360,7 @@ fun CallScreen(
                                         } else {
                                             repo.acceptCall(callId)
                                             startedWebRtc = true
-                                            runCatching { webRtc.startCallee(callId, callType == "video") }
+                                            runCatching { webRtc.startCallee(callId, withVideo) }
                                         }
                                     }
                                 }
@@ -352,32 +368,19 @@ fun CallScreen(
                                 Text("Trả lời", color = Color.White.copy(0.8f))
                             }
                         }
-                    }
-
-                    "accepted" -> {
-                        // === GIAO DIỆN ĐÀM THOẠI (SỬA Ở ĐÂY) ===
-                        // 1. Nút Mic (Mute/Unmute)
+                    } else if (status == "accepted") {
                         ControlButton(
                             icon = if (isMicOn) Icons.Rounded.Mic else Icons.Rounded.MicOff,
                             color = if (isMicOn) Color.White.copy(0.2f) else Color.White,
                             iconColor = if (isMicOn) Color.White else Color.Black
                         ) {
                             isMicOn = !isMicOn
-                            webRtc.toggleAudio(isMicOn) // Logic tắt mic
+                            webRtc.toggleAudio(isMicOn)
                         }
-
-                        // 2. Nút Kết thúc (End Call)
-                        ControlButton(
-                            icon = Icons.Rounded.CallEnd,
-                            color = Color(0xFFFF3B30),
-                            size = 72.dp
-                        ) {
-                            scope.launch { repo.endCall(callId); goBackOnce() }
+                        ControlButton(icon = Icons.Rounded.CallEnd, color = Color(0xFFFF3B30), size = 72.dp) {
+                            scope.launch { repo.endCall(callId); onBack() }
                         }
-
-                        // Đã XÓA nút Camera/Loa ở đây theo yêu cầu của bạn
-                    }
-                    else -> {
+                    } else {
                         Button(onClick = onBack) { Text("Đóng") }
                     }
                 }
@@ -386,7 +389,7 @@ fun CallScreen(
     }
 }
 
-// === COMPONENT CON ===
+// === COMPONENT CON & HELPER ===
 
 @Composable
 fun ControlButton(
@@ -403,41 +406,22 @@ fun ControlButton(
         colors = ButtonDefaults.buttonColors(containerColor = color),
         contentPadding = PaddingValues(0.dp)
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = iconColor,
-            modifier = Modifier.size(size * 0.5f)
-        )
+        Icon(imageVector = icon, contentDescription = null, tint = iconColor, modifier = Modifier.size(size * 0.5f))
     }
 }
 
 @Composable
 fun CallAvatar(name: String, bytes: ByteArray?, size: androidx.compose.ui.unit.Dp) {
     val initials = name.firstOrNull()?.uppercase() ?: "?"
-
     Box(
-        modifier = Modifier
-            .size(size)
-            .clip(CircleShape)
-            .background(Color.Gray),
+        modifier = Modifier.size(size).clip(CircleShape).background(Color.Gray),
         contentAlignment = Alignment.Center
     ) {
         if (bytes != null) {
-            val bmp = remember(bytes) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
-            Image(
-                bitmap = bmp.asImageBitmap(),
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
+            val bmp = remember(bytes) { android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+            Image(bitmap = bmp.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
         } else {
-            Text(
-                text = initials,
-                style = MaterialTheme.typography.displayMedium,
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
+            Text(text = initials, style = MaterialTheme.typography.displayMedium, color = Color.White, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -446,26 +430,27 @@ fun CallAvatar(name: String, bytes: ByteArray?, size: androidx.compose.ui.unit.D
 fun PulseAnimation() {
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val scale by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 1.4f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1500),
-            repeatMode = RepeatMode.Restart
-        ), label = "scale"
+        initialValue = 1f, targetValue = 1.4f,
+        animationSpec = infiniteRepeatable(animation = tween(1500), repeatMode = RepeatMode.Restart), label = "scale"
     )
     val alpha by infiniteTransition.animateFloat(
-        initialValue = 0.5f,
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1500),
-            repeatMode = RepeatMode.Restart
-        ), label = "alpha"
+        initialValue = 0.5f, targetValue = 0f,
+        animationSpec = infiniteRepeatable(animation = tween(1500), repeatMode = RepeatMode.Restart), label = "alpha"
     )
+    Box(modifier = Modifier.size(120.dp).scale(scale).background(Color.White.copy(alpha = alpha), CircleShape))
+}
 
-    Box(
-        modifier = Modifier
-            .size(120.dp)
-            .scale(scale)
-            .background(Color.White.copy(alpha = alpha), CircleShape)
-    )
+suspend fun captureBitmapFromSurface(view: SurfaceViewRenderer): Bitmap? {
+    return suspendCancellableCoroutine { cont ->
+        try {
+            val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+            val listener = PixelCopy.OnPixelCopyFinishedListener { copyResult ->
+                if (copyResult == PixelCopy.SUCCESS) cont.resume(bitmap)
+                else cont.resume(null)
+            }
+            PixelCopy.request(view, bitmap, listener, Handler(Looper.getMainLooper()))
+        } catch (e: Exception) {
+            cont.resume(null)
+        }
+    }
 }

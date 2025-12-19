@@ -5,11 +5,10 @@ import android.util.Base64
 import android.util.Log
 import com.example.chat_compose.model.ChatUser
 import com.example.chat_compose.model.Message
-import com.example.chat_compose.model.MessageStatus // Đảm bảo bạn đã có Enum này trong Message.kt
+import com.example.chat_compose.model.MessageStatus
 import com.example.chat_compose.model.ProfileExtras
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.DocumentChange
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreSettings
@@ -34,14 +33,10 @@ class ChatRepository(
         const val AI_BOT_EMAIL = "bot@huyan.ai"
     }
 
-    // Repository gọi Gemini
     private val aiRepo = GeminiAiRepository()
-
-    // Storage Reference (Để upload ảnh, voice)
     private val storageRef = FirebaseStorage.getInstance().reference
 
     init {
-        // Tắt offline cache để tránh lỗi SQLiteDiskIOException trên một số máy ảo
         val settings = FirebaseFirestoreSettings.Builder()
             .setPersistenceEnabled(false)
             .build()
@@ -90,40 +85,90 @@ class ChatRepository(
 
     suspend fun updateOnlineStatus(isOnline: Boolean) {
         val uid = currentUserId() ?: return
-        val data = mapOf(
-            "isOnline" to isOnline,
-            "lastSeen" to FieldValue.serverTimestamp()
-        )
-        runCatching { db.collection("users").document(uid).update(data).await() }
+        runCatching {
+            db.collection("users").document(uid)
+                .update(
+                    mapOf(
+                        "isOnline" to isOnline,
+                        "lastSeen" to FieldValue.serverTimestamp()
+                    )
+                ).await()
+        }
     }
 
-    // ================= FCM TOKEN =================
     suspend fun syncFcmToken(): Result<String> {
         val uid = currentUserId() ?: return Result.failure(Exception("Not logged in"))
         return try {
             val token = FirebaseMessaging.getInstance().token.await()
-            Log.d("ChatRepo", "FCM Token: $token")
-
-            val updateData = mapOf("fcmToken" to token)
             db.collection("users").document(uid)
-                .set(updateData, SetOptions.merge())
+                .set(mapOf("fcmToken" to token), SetOptions.merge())
                 .await()
-
             Result.success(token)
         } catch (e: Exception) {
-            Log.e("ChatRepo", "syncFcmToken error: ${e.message}")
             Result.failure(e)
         }
     }
 
-    // ================= USERS =================
+    // ================= PASSWORD & EMAIL =================
+    /**
+     * Reset mật khẩu qua email (dùng callback như AuthViewModel đang gọi).
+     * Ví dụ: repo.resetPassword(email) { result -> ... }
+     */
+    fun resetPassword(email: String, cb: (Result<Unit>) -> Unit) {
+        auth.sendPasswordResetEmail(email.trim())
+            .addOnSuccessListener { cb(Result.success(Unit)) }
+            .addOnFailureListener { cb(Result.failure(it)) }
+    }
+
+    fun sendEmailVerification() {
+        auth.currentUser?.sendEmailVerification()
+    }
+
+    fun isCurrentUserEmailVerified(): Boolean {
+        return auth.currentUser?.isEmailVerified ?: true
+    }
+
+    // ================= USERS & PROFILE =================
+    suspend fun getUserProfile(uid: String): ChatUser? {
+        if (uid == AI_BOT_ID) {
+            return ChatUser(
+                uid = AI_BOT_ID,
+                email = AI_BOT_EMAIL,
+                displayName = AI_BOT_NAME,
+                isOnline = true,
+                lastSeen = null,
+                avatarBytes = null
+            )
+        }
+
+        return try {
+            val doc = db.collection("users").document(uid).get().await()
+            if (!doc.exists()) return null
+
+            val avatarBytes = doc.getString("avatarBase64")?.let {
+                runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
+            }
+
+            ChatUser(
+                uid = doc.getString("uid") ?: uid,
+                email = doc.getString("email") ?: "",
+                displayName = doc.getString("displayName") ?: "",
+                isOnline = doc.getBoolean("isOnline") == true,
+                lastSeen = doc.getTimestamp("lastSeen")?.toDate(),
+                avatarBytes = avatarBytes
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun listenUser(uid: String): Flow<ChatUser?> = callbackFlow {
         if (uid == AI_BOT_ID) {
             trySend(
                 ChatUser(
                     uid = AI_BOT_ID,
-                    displayName = AI_BOT_NAME,
                     email = AI_BOT_EMAIL,
+                    displayName = AI_BOT_NAME,
                     isOnline = true,
                     lastSeen = null,
                     avatarBytes = null
@@ -140,11 +185,9 @@ class ChatRepository(
                     return@addSnapshotListener
                 }
 
-                val avatarBase64 = snap.getString("avatarBase64")
-                val avatarBytes = avatarBase64?.let {
+                val avatarBytes = snap.getString("avatarBase64")?.let {
                     runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
                 }
-                val lastSeen = snap.getTimestamp("lastSeen")?.toDate()
 
                 trySend(
                     ChatUser(
@@ -152,19 +195,20 @@ class ChatRepository(
                         email = snap.getString("email") ?: "",
                         displayName = snap.getString("displayName") ?: "",
                         isOnline = snap.getBoolean("isOnline") == true,
-                        lastSeen = lastSeen,
+                        lastSeen = snap.getTimestamp("lastSeen")?.toDate(),
                         avatarBytes = avatarBytes
                     )
                 )
             }
+
         awaitClose { reg.remove() }
     }
 
     fun listenFriends(myUid: String): Flow<List<ChatUser>> = callbackFlow {
         val bot = ChatUser(
             uid = AI_BOT_ID,
-            displayName = AI_BOT_NAME,
             email = AI_BOT_EMAIL,
+            displayName = AI_BOT_NAME,
             isOnline = true,
             lastSeen = null,
             avatarBytes = null
@@ -180,25 +224,23 @@ class ChatRepository(
                 val users = snap.documents
                     .filter { it.id != myUid }
                     .mapNotNull { doc ->
-                        val avatarBase64 = doc.getString("avatarBase64")
-                        val avatarBytes = avatarBase64?.let {
+                        val avatarBytes = doc.getString("avatarBase64")?.let {
                             runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
                         }
-                        val lastSeen = doc.getTimestamp("lastSeen")?.toDate()
 
                         ChatUser(
                             uid = doc.getString("uid") ?: doc.id,
                             email = doc.getString("email") ?: "",
                             displayName = doc.getString("displayName") ?: "",
                             isOnline = doc.getBoolean("isOnline") == true,
-                            lastSeen = lastSeen,
+                            lastSeen = doc.getTimestamp("lastSeen")?.toDate(),
                             avatarBytes = avatarBytes
                         )
                     }
 
-                val finalList = listOf(bot) + users.filter { it.uid != AI_BOT_ID }
-                trySend(finalList)
+                trySend(listOf(bot) + users.filter { it.uid != AI_BOT_ID })
             }
+
         awaitClose { reg.remove() }
     }
 
@@ -207,59 +249,54 @@ class ChatRepository(
         return if (myUid < partnerId) "${myUid}_$partnerId" else "${partnerId}_$myUid"
     }
 
-    // 1. CẬP NHẬT TRẠNG THÁI TYPING (ĐANG GÕ)
+    fun getMessagesFlow(partnerId: String): Flow<List<Message>> = listenMessages(partnerId)
+
+    // 1. TYPING
     suspend fun setTyping(partnerId: String, isTyping: Boolean) {
         val myUid = currentUserId() ?: return
         val cid = chatId(myUid, partnerId)
-
-        // Lưu trạng thái gõ của user hiện tại vào document chat chung
-        // Ví dụ: typing_USER_A = true
-        val fieldName = "typing_$myUid"
-        val data = mapOf(fieldName to isTyping)
-
-        try {
+        val data = mapOf<String, Any>("typing_$myUid" to isTyping)
+        runCatching {
             db.collection("chats").document(cid)
                 .set(data, SetOptions.merge())
-        } catch (e: Exception) {
-            e.printStackTrace()
+                .await()
         }
     }
 
-    // 2. LẮNG NGHE ĐỐI PHƯƠNG ĐANG GÕ
-    fun listenPartnerTyping(partnerId: String): Flow<Boolean> = callbackFlow {
-        val myUid = currentUserId() ?: run { trySend(false); return@callbackFlow }
-        val cid = chatId(myUid, partnerId)
-        val targetField = "typing_$partnerId"
+    suspend fun setTypingStatus(partnerId: String, isTyping: Boolean) = setTyping(partnerId, isTyping)
 
+    // 2. LISTEN TYPING
+    fun listenPartnerTyping(partnerId: String): Flow<Boolean> = callbackFlow {
+        val myUid = currentUserId() ?: run {
+            trySend(false)
+            return@callbackFlow
+        }
+
+        val cid = chatId(myUid, partnerId)
         val reg = db.collection("chats").document(cid)
             .addSnapshotListener { snap, _ ->
-                if (snap != null && snap.exists()) {
-                    val isTyping = snap.getBoolean(targetField) ?: false
-                    trySend(isTyping)
-                } else {
-                    trySend(false)
-                }
+                trySend(snap?.getBoolean("typing_$partnerId") ?: false)
             }
+
         awaitClose { reg.remove() }
     }
 
-    // 3. ĐÁNH DẤU TIN NHẮN LÀ ĐÃ XEM (READ)
+    fun listenToPartnerTyping(partnerId: String) = listenPartnerTyping(partnerId)
+
+    // 3. MARK READ
     suspend fun markMessagesAsRead(partnerId: String) {
         val myUid = currentUserId() ?: return
         val cid = chatId(myUid, partnerId)
 
-        // Tìm các tin nhắn do ĐỐI PHƯƠNG gửi (fromId == partnerId)
-        // Mà trạng thái KHÁC 'READ' (chưa đọc)
         val query = db.collection("chats").document(cid)
             .collection("messages")
             .whereEqualTo("fromId", partnerId)
-            .whereNotEqualTo("status", "READ") // Cần index Firestore nếu dữ liệu lớn
+            .whereNotEqualTo("status", "READ")
             .get()
             .await()
 
         if (query.isEmpty) return
 
-        // Dùng Batch để update nhiều tin cùng lúc
         val batch = db.batch()
         for (doc in query.documents) {
             batch.update(doc.reference, "status", "READ")
@@ -272,7 +309,7 @@ class ChatRepository(
         val cid = chatId(myUid, partnerId)
         val msgDoc = db.collection("chats").document(cid).collection("messages").document()
 
-        val data = hashMapOf<String, Any?>(
+        val data = hashMapOf(
             "id" to msgDoc.id,
             "fromId" to myUid,
             "toId" to partnerId,
@@ -283,12 +320,19 @@ class ChatRepository(
             "imageBase64" to null,
             "audioUrl" to null,
             "reactions" to emptyMap<String, String>(),
-            "status" to "SENT" // Mặc định là SENT
+            "status" to "SENT"
         )
+
         msgDoc.set(data).await()
     }
 
-    suspend fun sendImageMessage(partnerId: String, bytes: ByteArray, text: String = "", replyingTo: Message? = null) {
+    // --- GỬI ẢNH (HỖ TRỢ AI) ---
+    suspend fun sendImageMessage(
+        partnerId: String,
+        bytes: ByteArray,
+        text: String = "",
+        replyingTo: Message? = null
+    ) {
         val myUid = currentUserId() ?: return
         val cid = chatId(myUid, partnerId)
         val msgDoc = db.collection("chats").document(cid).collection("messages").document()
@@ -307,15 +351,20 @@ class ChatRepository(
             "reactions" to emptyMap<String, String>(),
             "status" to "SENT"
         )
+
         msgDoc.set(data).await()
+
+        if (partnerId == AI_BOT_ID) {
+            processAiMedia(myUid, cid, text, imageBytes = bytes, audioBytes = null)
+        }
     }
 
+    // --- GỬI VOICE (HỖ TRỢ AI) ---
     suspend fun sendVoiceMessage(partnerId: String, audioFile: File) {
         val myUid = currentUserId() ?: return
         val cid = chatId(myUid, partnerId)
         val msgDoc = db.collection("chats").document(cid).collection("messages").document()
 
-        // Upload lên Firebase Storage
         val audioRef = storageRef.child("chat_audio/${msgDoc.id}.mp3")
         val uri = Uri.fromFile(audioFile)
         audioRef.putFile(uri).await()
@@ -332,137 +381,102 @@ class ChatRepository(
             "reactions" to emptyMap<String, String>(),
             "status" to "SENT"
         )
+
         msgDoc.set(data).await()
+
+        if (partnerId == AI_BOT_ID) {
+            runCatching {
+                val audioBytes = audioFile.readBytes()
+                processAiMedia(myUid, cid, "", imageBytes = null, audioBytes = audioBytes)
+            }.onFailure {
+                Log.e("ChatRepository", "Lỗi đọc file audio cho AI: ${it.message}")
+            }
+        }
     }
 
-    suspend fun translateText(text: String): String {
-        return try {
-            val prompt = "Translate the following text to Vietnamese (Tiếng Việt), only return the result: \"$text\""
-            aiRepo.reply(history = emptyList(), userText = prompt)
+    // --- XỬ LÝ MEDIA CHO AI ---
+    private suspend fun processAiMedia(
+        myUid: String,
+        cid: String,
+        text: String,
+        imageBytes: ByteArray?,
+        audioBytes: ByteArray?
+    ) {
+        try {
+            val snap = db.collection("chats").document(cid).collection("messages")
+                .orderBy("createdAt", Query.Direction.ASCENDING)
+                .limitToLast(10)
+                .get()
+                .await()
+
+            val history = snap.documents.map { docToMessage(it) }
+
+            val aiText = aiRepo.replyWithMedia(history, text, imageBytes, audioBytes).trim()
+            if (aiText.isBlank()) return
+
+            saveBotResponse(cid, myUid, aiText)
         } catch (e: Exception) {
-            "Lỗi dịch: ${e.message}"
+            Log.e("ChatRepository", "Lỗi xử lý AI Media: ${e.message}")
         }
     }
 
-    // ================= LISTEN MESSAGES =================
-    fun listenMessages(partnerId: String): Flow<List<Message>> = callbackFlow {
-        val myUid = currentUserId() ?: run {
-            trySend(emptyList())
-            close()
-            return@callbackFlow
-        }
-
-        val cid = chatId(myUid, partnerId)
-        val reg = db.collection("chats").document(cid)
-            .collection("messages")
-            .orderBy("createdAt", Query.Direction.ASCENDING)
-            .addSnapshotListener { snap, _ ->
-                if (snap == null) {
-                    trySend(emptyList())
-                    return@addSnapshotListener
-                }
-
-                val list = snap.documents.mapNotNull { doc ->
-                    val imageBase64 = doc.getString("imageBase64")
-                    val imageBytes = imageBase64?.let {
-                        runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
-                    }
-                    val createdAt = doc.getTimestamp("createdAt")?.toDate()
-                    val audioUrl = doc.getString("audioUrl")
-
-                    val reactionsAny = doc.get("reactions")
-                    val reactions = (reactionsAny as? Map<*, *>)?.mapNotNull { (k, v) ->
-                        val kk = k as? String
-                        val vv = v as? String
-                        if (kk != null && vv != null) kk to vv else null
-                    }?.toMap() ?: emptyMap()
-
-                    // Map Status (READ/SENT)
-                    val statusStr = doc.getString("status") ?: "SENT"
-                    val status = try {
-                        MessageStatus.valueOf(statusStr)
-                    } catch (e: Exception) {
-                        MessageStatus.SENT
-                    }
-
-                    Message(
-                        id = doc.getString("id") ?: doc.id,
-                        fromId = doc.getString("fromId") ?: "",
-                        toId = doc.getString("toId") ?: "",
-                        text = doc.getString("text") ?: "",
-                        createdAt = createdAt,
-                        replyToId = doc.getString("replyToId"),
-                        replyPreview = doc.getString("replyPreview"),
-                        imageBytes = imageBytes,
-                        audioUrl = audioUrl,
-                        reactions = reactions,
-                        status = status // Gán status vào model
-                    )
-                }
-                trySend(list)
-            }
-        awaitClose { reg.remove() }
-    }
-
-    suspend fun toggleReaction(partnerId: String, msgId: String, emoji: String) {
+    // --- AI TEXT ---
+    suspend fun sendAiMessage(text: String, replyingTo: Message? = null) {
         val myUid = currentUserId() ?: return
-        val cid = chatId(myUid, partnerId)
-        val ref = db.collection("chats").document(cid).collection("messages").document(msgId)
+        val cleanText = text.trim()
+        if (cleanText.isBlank()) return
 
-        db.runTransaction { tr ->
-            val snap = tr.get(ref)
-            val reactions = (snap.get("reactions") as? Map<String, String>)?.toMutableMap() ?: mutableMapOf()
-            val current = reactions[myUid]
-            if (current == emoji) reactions.remove(myUid) else reactions[myUid] = emoji
-            tr.update(ref, "reactions", reactions)
-        }.await()
-    }
+        try {
+            sendMessage(AI_BOT_ID, cleanText, replyingTo)
+            val cid = chatId(myUid, AI_BOT_ID)
 
-    // ================= LOCAL LISTENER =================
-    fun listenIncomingMessagesToMe(myUid: String): Flow<IncomingMsgEvent> = callbackFlow {
-        var firstSnapshot = true
-        Log.d("ChatRepo", "Start listening msg for: $myUid")
+            val snap = db.collection("chats").document(cid).collection("messages")
+                .orderBy("createdAt", Query.Direction.ASCENDING)
+                .limitToLast(20)
+                .get()
+                .await()
 
-        val query = db.collectionGroup("messages").whereEqualTo("toId", myUid)
-        val reg = query.addSnapshotListener { snap, err ->
-            if (err != null || snap == null) return@addSnapshotListener
-            if (firstSnapshot) { firstSnapshot = false; return@addSnapshotListener }
+            val history = snap.documents.map { docToMessage(it) }
 
-            for (dc in snap.documentChanges) {
-                if (dc.type != DocumentChange.Type.ADDED) continue
-                val doc = dc.document
-                val msgId = doc.getString("id") ?: doc.id
-                val fromId = doc.getString("fromId") ?: ""
-                val text = doc.getString("text") ?: ""
-                val img = doc.getString("imageBase64")
+            val aiText = aiRepo.replyWithMedia(history, cleanText, null, null).trim()
+            if (aiText.isBlank()) return
 
-                trySend(IncomingMsgEvent(msgId, fromId, text, img))
-            }
+            saveBotResponse(cid, myUid, aiText)
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "Lỗi AI Chat: ${e.message}")
         }
-        awaitClose { reg.remove() }
     }
 
-    suspend fun updateAvatar(bytes: ByteArray) {
-        val uid = currentUserId() ?: return
-        val avatarBase64 = Base64.encodeToString(bytes, Base64.DEFAULT)
-        db.collection("users").document(uid).update("avatarBase64", avatarBase64).await()
+    private suspend fun saveBotResponse(cid: String, toId: String, aiText: String) {
+        val botDoc = db.collection("chats").document(cid).collection("messages").document()
+        val data = hashMapOf<String, Any?>(
+            "id" to botDoc.id,
+            "fromId" to AI_BOT_ID,
+            "toId" to toId,
+            "text" to aiText,
+            "createdAt" to FieldValue.serverTimestamp(),
+            "replyToId" to null,
+            "replyPreview" to null,
+            "imageBase64" to null,
+            "audioUrl" to null,
+            "reactions" to emptyMap<String, String>(),
+            "status" to "SENT"
+        )
+        botDoc.set(data).await()
     }
 
+    // ================= HELPERS =================
     private fun docToMessage(doc: com.google.firebase.firestore.DocumentSnapshot): Message {
         val imageBase64 = doc.getString("imageBase64")
         val imageBytes = imageBase64?.let { runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull() }
         val createdAt = doc.getTimestamp("createdAt")?.toDate()
-        val audioUrl = doc.getString("audioUrl")
 
-        val reactionsAny = doc.get("reactions")
-        val reactions = (reactionsAny as? Map<*, *>)?.mapNotNull { (k, v) ->
-            val kk = k as? String
-            val vv = v as? String
-            if (kk != null && vv != null) kk to vv else null
+        val reactions = (doc.get("reactions") as? Map<*, *>)?.mapNotNull { (k, v) ->
+            if (k is String && v is String) k to v else null
         }?.toMap() ?: emptyMap()
 
         val statusStr = doc.getString("status") ?: "SENT"
-        val status = try { MessageStatus.valueOf(statusStr) } catch (e: Exception) { MessageStatus.SENT }
+        val status = try { MessageStatus.valueOf(statusStr) } catch (_: Exception) { MessageStatus.SENT }
 
         return Message(
             id = doc.getString("id") ?: doc.id,
@@ -473,97 +487,147 @@ class ChatRepository(
             replyToId = doc.getString("replyToId"),
             replyPreview = doc.getString("replyPreview"),
             imageBytes = imageBytes,
-            audioUrl = audioUrl,
+            audioUrl = doc.getString("audioUrl"),
             reactions = reactions,
             status = status
         )
     }
 
-    // ================= AI CHAT =================
-    suspend fun sendAiMessage(text: String, replyingTo: Message? = null) {
-        val myUid = currentUserId() ?: return
-        val cleanText = text.trim()
-        if (cleanText.isBlank()) return
+    // ================= SMART REPLY =================
+    suspend fun generateSmartReplies(
+        partnerId: String,
+        partnerName: String? = null,
+        recentMessages: List<Message>
+    ): List<String> {
+        if (partnerId.isBlank() || partnerId == AI_BOT_ID) return emptyList()
 
-        try {
-            sendMessage(AI_BOT_ID, cleanText, replyingTo)
+        val history = recentMessages
+            .filter { it.text.isNotBlank() && it.imageBytes == null && it.audioUrl == null }
+            .takeLast(12)
 
-            val cid = chatId(myUid, AI_BOT_ID)
-            val snap = db.collection("chats").document(cid)
-                .collection("messages")
-                .orderBy("createdAt", Query.Direction.ASCENDING)
-                .limitToLast(20)
-                .get()
-                .await()
+        if (history.isEmpty()) return emptyList()
 
-            val history = snap.documents.map { docToMessage(it) }
-            val aiText = aiRepo.reply(history = history, userText = cleanText).trim()
-            if (aiText.isBlank()) return
+        return try {
+            val prompt = buildString {
+                append("Hãy đề xuất đúng 3 câu trả lời ngắn, tự nhiên bằng tiếng Việt cho tin nhắn cuối cùng.\n")
+                append("Mỗi câu <= 12 từ. Không emoji. Không đánh số. Không bullet.\n")
+                if (!partnerName.isNullOrBlank()) append("Tên người kia: ").append(partnerName).append("\n")
+                append("Chỉ trả về đúng 3 dòng, mỗi dòng 1 gợi ý.")
+            }
 
-            val botDoc = db.collection("chats").document(cid).collection("messages").document()
-            val data = hashMapOf<String, Any?>(
-                "id" to botDoc.id,
-                "fromId" to AI_BOT_ID,
-                "toId" to myUid,
-                "text" to aiText,
-                "createdAt" to FieldValue.serverTimestamp(),
-                "replyToId" to null,
-                "replyPreview" to null,
-                "imageBase64" to null,
-                "audioUrl" to null,
-                "reactions" to emptyMap<String, String>(),
-                "status" to "SENT"
-            )
-            botDoc.set(data).await()
-        } catch (e: Exception) {
-            Log.e("ChatRepository", "Lỗi AI Chat: ${e.message}")
+            val raw = aiRepo.replyWithMedia(history, prompt, null, null).trim()
+
+            raw.replace("\r", "\n").lines()
+                .flatMap { it.split("|", "•", ";").map { s -> s.trim() } }
+                .map { it.replace(Regex("^[-•\\d\\).:]+\\s*"), "").trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .take(3)
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 
+    suspend fun translateText(text: String): String {
+        return try {
+            aiRepo.replyWithMedia(emptyList(), "Dịch sang Tiếng Việt: \"$text\"", null, null).trim()
+        } catch (e: Exception) {
+            "Lỗi dịch: ${e.message}"
+        }
+    }
+
+    fun listenMessages(partnerId: String): Flow<List<Message>> = callbackFlow {
+        val myUid = currentUserId() ?: run {
+            trySend(emptyList())
+            close()
+            return@callbackFlow
+        }
+
+        val cid = chatId(myUid, partnerId)
+        val reg = db.collection("chats").document(cid).collection("messages")
+            .orderBy("createdAt", Query.Direction.ASCENDING)
+            .addSnapshotListener { snap, _ ->
+                if (snap != null) {
+                    trySend(snap.documents.map { docToMessage(it) })
+                } else {
+                    trySend(emptyList())
+                }
+            }
+
+        awaitClose { reg.remove() }
+    }
+
+    suspend fun toggleReaction(partnerId: String, msgId: String, emoji: String) {
+        val myUid = currentUserId() ?: return
+        val cid = chatId(myUid, partnerId)
+        val ref = db.collection("chats").document(cid).collection("messages").document(msgId)
+
+        db.runTransaction { tr ->
+            val snap = tr.get(ref)
+            val reactions = (snap.get("reactions") as? Map<String, String>)
+                ?.toMutableMap()
+                ?: mutableMapOf()
+
+            if (reactions[myUid] == emoji) reactions.remove(myUid) else reactions[myUid] = emoji
+            tr.update(ref, "reactions", reactions)
+        }.await()
+    }
+
     // ================= PROFILE EXTRAS =================
-    fun resetPassword(email: String, cb: (Result<Unit>) -> Unit) {
-        auth.sendPasswordResetEmail(email.trim())
-            .addOnSuccessListener { cb(Result.success(Unit)) }
-            .addOnFailureListener { cb(Result.failure(it)) }
-    }
-
-    fun sendEmailVerification() {
-        auth.currentUser?.sendEmailVerification()
-    }
-
-    fun isCurrentUserEmailVerified(): Boolean {
-        return auth.currentUser?.isEmailVerified ?: true
-    }
-
     suspend fun getProfileExtras(uid: String): ProfileExtras {
         val doc = db.collection("users").document(uid).get().await()
-        val birth = doc.getLong("birthDateMillis")
-        val gender = doc.getString("gender")
-        return ProfileExtras(birth, gender)
+        return ProfileExtras(doc.getLong("birthDateMillis"), doc.getString("gender"))
     }
 
     suspend fun updateProfileExtras(birthDateMillis: Long?, gender: String) {
         val uid = currentUserId() ?: return
-        val data = hashMapOf<String, Any?>(
-            "birthDateMillis" to birthDateMillis,
-            "gender" to gender
-        )
-        db.collection("users").document(uid).update(data).await()
+        db.collection("users").document(uid)
+            .update(mapOf("birthDateMillis" to birthDateMillis, "gender" to gender))
+            .await()
     }
 
-    suspend fun changePassword(currentPassword: String, newPassword: String) {
+    suspend fun changePassword(oldP: String, newP: String) {
         val user = auth.currentUser ?: throw IllegalStateException("Chưa đăng nhập")
         val email = user.email ?: throw IllegalStateException("Tài khoản không có email")
 
-        val credential = EmailAuthProvider.getCredential(email, currentPassword)
-        user.reauthenticate(credential).await()
-        user.updatePassword(newPassword).await()
+        user.reauthenticate(EmailAuthProvider.getCredential(email, oldP)).await()
+        user.updatePassword(newP).await()
+    }
+    suspend fun updateAvatar(avatarBytes: ByteArray): Result<Unit> {
+        val uid = currentUserId() ?: return Result.failure(Exception("Chưa đăng nhập"))
+        return try {
+            val b64 = Base64.encodeToString(avatarBytes, Base64.DEFAULT)
+            db.collection("users").document(uid)
+                .set(
+                    mapOf(
+                        "avatarBase64" to b64,
+                        "lastSeen" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                )
+                .await()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Xoá avatar (set null) */
+    suspend fun clearAvatar(): Result<Unit> {
+        val uid = currentUserId() ?: return Result.failure(Exception("Chưa đăng nhập"))
+        return try {
+            db.collection("users").document(uid)
+                .set(
+                    mapOf(
+                        "avatarBase64" to null,
+                        "lastSeen" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                )
+                .await()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 }
-
-data class IncomingMsgEvent(
-    val msgId: String,
-    val fromId: String,
-    val text: String,
-    val imageBase64: String?
-)

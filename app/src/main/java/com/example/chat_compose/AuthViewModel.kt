@@ -5,12 +5,16 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.chat_compose.data.CallRepository // Import CallRepository để check ban
 import com.example.chat_compose.data.ChatRepository
 import kotlinx.coroutines.launch
 
 class AuthViewModel(
     private val repo: ChatRepository = ChatRepository()
 ) : ViewModel() {
+
+    // Thêm CallRepository để dùng hàm checkBanStatus
+    private val callRepo = CallRepository()
 
     var isLoading by mutableStateOf(false)
         private set
@@ -25,40 +29,62 @@ class AuthViewModel(
             isLoading = true
             error = null
             val res = repo.register(email, pass, name)
-            isLoading = false
 
+            // Register xong thường chưa bị ban, nhưng an toàn thì vẫn check sau này
             if (res.isSuccess) {
-                // best-effort: không để lỗi online status phá flow
                 runCatching { repo.updateOnlineStatus(true) }
-
-
+                isLoading = false
                 onSuccess()
             } else {
+                isLoading = false
                 error = res.exceptionOrNull()?.message
             }
         }
     }
 
+    // === CHỈNH SỬA CHÍNH Ở HÀM LOGIN ===
     fun login(email: String, pass: String, onSuccess: () -> Unit) {
         viewModelScope.launch {
             isLoading = true
             error = null
 
+            // 1. Đăng nhập vào Firebase Auth
             val res = repo.login(email, pass)
 
-            isLoading = false
-
             if (res.isSuccess) {
-                // update online status chỉ khi login OK, và không được làm crash luồng
-                runCatching {
-                    repo.updateOnlineStatus(true)
+                val uid = repo.currentUserId()
+                if (uid != null) {
+                    // 2. KIỂM TRA TRẠNG THÁI KHÓA TÀI KHOẢN
+                    // Gọi hàm checkBanStatus từ CallRepository
+                    val banDate = callRepo.checkBanStatus(uid)
+
+                    if (banDate != null) {
+                        // === TRƯỜNG HỢP BỊ KHÓA ===
+                        // Logout ngay lập tức để không lưu session
+                        repo.logout()
+
+                        isLoading = false
+                        error = "Tài khoản bị khóa đến $banDate do vi phạm chính sách."
+                    } else {
+                        // === TRƯỜNG HỢP SẠCH ===
+                        // Update online status
+                        runCatching {
+                            repo.updateOnlineStatus(true)
+                        }
+                        isLoading = false
+                        onSuccess()
+                    }
+                } else {
+                    isLoading = false
+                    error = "Không tìm thấy User ID"
                 }
-                onSuccess()
             } else {
+                isLoading = false
                 error = res.exceptionOrNull()?.message
             }
         }
     }
+
     fun resetPassword(email: String, onDone: (Boolean) -> Unit) {
         isLoading = true
         error = null
@@ -72,9 +98,9 @@ class AuthViewModel(
             }
         }
     }
+
     fun logout() {
         viewModelScope.launch {
-            // best-effort: logout vẫn phải chạy kể cả updateOnlineStatus lỗi
             runCatching { repo.updateOnlineStatus(false) }
             repo.logout()
         }

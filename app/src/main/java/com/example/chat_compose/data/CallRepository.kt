@@ -12,6 +12,7 @@ import kotlinx.coroutines.tasks.await
 import org.webrtc.IceCandidate
 import android.util.Base64
 import com.example.chat_compose.data.ChatRepository
+import java.util.Date
 data class IncomingCall(
     val id: String = "",
     val callerId: String = "",
@@ -258,6 +259,62 @@ class CallRepository(
             msgDoc.set(data).await()
         } catch (e: Exception) {
             Log.e("CallRepo", "Failed to write call log", e)
+        }
+    }
+    suspend fun reportSensitiveContent(): Boolean {
+        val myUid = currentUid() ?: return false
+        val userRef = db.collection("users").document(myUid)
+
+        return try {
+            db.runTransaction { transaction ->
+                val snapshot = transaction.get(userRef)
+
+                val currentViolations = snapshot.getLong("violationCount") ?: 0
+                val newCount = currentViolations + 1
+
+                transaction.update(userRef, "violationCount", newCount)
+
+                // Nếu vi phạm >= 3 lần -> Khóa 30 ngày
+                if (newCount >= 3) {
+                    // Tính 30 ngày ra mili-giây
+                    val thirtyDaysInMs = 30L * 24 * 60 * 60 * 1000
+                    val unlockTime = System.currentTimeMillis() + thirtyDaysInMs
+
+                    // Lưu thời điểm được mở khóa
+                    transaction.update(userRef, "lockedUntil", unlockTime)
+
+                    // (Tùy chọn) Reset số lần vi phạm về 0 để sau 30 ngày tính lại từ đầu
+                    // transaction.update(userRef, "violationCount", 0)
+
+                    return@runTransaction true // BỊ KHÓA
+                }
+                return@runTransaction false // CHƯA BỊ KHÓA
+            }.await()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    // === 2. HÀM KIỂM TRA CẤM ĐĂNG NHẬP (Dùng ở màn hình Login) ===
+    // Trả về: Null nếu không bị cấm, hoặc String chứa ngày mở khóa nếu đang bị cấm
+    suspend fun checkBanStatus(uid: String): String? {
+        return try {
+            val doc = db.collection("users").document(uid).get().await()
+            val lockedUntil = doc.getLong("lockedUntil") ?: 0L
+            val now = System.currentTimeMillis()
+
+            if (lockedUntil > now) {
+                // Vẫn đang trong thời gian cấm
+                val date = Date(lockedUntil)
+                val format = java.text.SimpleDateFormat("dd/MM/yyyy HH:mm", java.util.Locale.getDefault())
+                return format.format(date) // Trả về ngày được mở
+            } else {
+                // Đã hết hạn cấm hoặc chưa từng bị cấm
+                return null
+            }
+        } catch (e: Exception) {
+            null
         }
     }
 }

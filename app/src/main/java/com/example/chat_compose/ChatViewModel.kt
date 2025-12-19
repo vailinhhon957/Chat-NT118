@@ -1,24 +1,27 @@
 package com.example.chat_compose
 
+import android.content.Context
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.chat_compose.data.AudioRecorder
 import com.example.chat_compose.data.ChatRepository
 import com.example.chat_compose.model.ChatUser
 import com.example.chat_compose.model.Message
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
-import com.example.chat_compose.data.AudioRecorder
-import java.io.File
-import androidx.compose.runtime.mutableStateMapOf
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.io.File
+
 class ChatViewModel(
     private val repo: ChatRepository = ChatRepository()
 ) : ViewModel() {
 
-    // ============= DANH SÁCH BẠN BÈ (HomeScreen dùng) =============
+    // ============= 1. FRIEND LIST =============
     var friends by mutableStateOf<List<ChatUser>>(emptyList())
         private set
 
@@ -34,7 +37,7 @@ class ChatViewModel(
         }
     }
 
-    // ================== STATE CHAT ==================
+    // ================== 2. CHAT STATE ==================
     var messages by mutableStateOf<List<Message>>(emptyList())
         private set
 
@@ -47,92 +50,207 @@ class ChatViewModel(
     private var msgJob: Job? = null
     private var partnerJob: Job? = null
 
-    // ===== ONLINE STATUS (MainActivity dùng) =====
     suspend fun updateOnlineStatus(isOnline: Boolean) {
         repo.updateOnlineStatus(isOnline)
     }
 
-    // ===== LOAD / LISTEN PARTNER =====
     fun listenPartner(uid: String) {
         partnerJob?.cancel()
         partnerJob = viewModelScope.launch {
             repo.listenUser(uid).collect { user ->
                 partnerUser = user
+                maybeGenerateSmartRepliesIfNeeded(uid)
             }
         }
     }
 
-    // ===== LISTEN MESSAGE VỚI 1 NGƯỜI =====
+    // ================== 3. SMART REPLY (Gemini) ==================
+    val smartSuggestions = mutableStateListOf<String>()
+
+    var isSmartReplyLoading by mutableStateOf(false)
+        private set
+
+    private var smartReplyJob: Job? = null
+    private var lastSuggestedForMsgId: String? = null
+
+    private fun maybeGenerateSmartRepliesIfNeeded(partnerId: String) {
+        val myId = repo.currentUserId() ?: return
+        val last = messages.lastOrNull() ?: return
+
+        // chỉ gợi ý nếu tin nhắn cuối là của đối phương
+        if (last.fromId == myId) return
+
+        // tránh gọi lại cho cùng 1 message
+        if (lastSuggestedForMsgId == last.id) return
+
+        // bỏ qua ảnh/voice
+        if (last.text.isBlank() || last.imageBytes != null || last.audioUrl != null) {
+            lastSuggestedForMsgId = last.id
+            smartSuggestions.clear()
+            return
+        }
+
+        smartReplyJob?.cancel()
+        smartReplyJob = viewModelScope.launch {
+            delay(350)
+            isSmartReplyLoading = true
+
+            val suggestions = repo.generateSmartReplies(
+                partnerId = partnerId,
+                partnerName = partnerUser?.displayName,
+                recentMessages = messages.takeLast(20)
+            )
+
+            smartSuggestions.clear()
+            smartSuggestions.addAll(suggestions)
+            lastSuggestedForMsgId = last.id
+            isSmartReplyLoading = false
+        }
+    }
+
     fun listenMessages(partnerId: String) {
         msgJob?.cancel()
         msgJob = viewModelScope.launch {
             repo.listenMessages(partnerId).collect { list ->
                 messages = list
+                if (messages.isNotEmpty()) {
+                    maybeGenerateSmartRepliesIfNeeded(partnerId)
+                } else {
+                    smartSuggestions.clear()
+                }
             }
         }
     }
 
-    // ===== REPLY =====
-    fun startReply(msg: Message) {
-        replyingTo = msg
-    }
+    // ================== 4. SEND & REPLY ==================
+    fun startReply(msg: Message) { replyingTo = msg }
+    fun cancelReply() { replyingTo = null }
 
-    fun cancelReply() {
-        replyingTo = null
-    }
-
-    // ===== GỬI TIN NHẮN (QUAN TRỌNG: Đã sửa logic AI ở đây) =====
     fun sendMessage(partnerId: String, text: String) {
         if (text.isBlank()) return
         val reply = replyingTo
 
         viewModelScope.launch {
-            // [SỬA LẠI] Kiểm tra ID người nhận
             if (partnerId == ChatRepository.AI_BOT_ID) {
-                // Nếu là Bot -> Gọi hàm AI (Gửi tin User -> Gọi Gemini -> Gửi tin Bot)
                 repo.sendAiMessage(text = text.trim(), replyingTo = reply)
             } else {
-                // Nếu là người thường -> Gửi bình thường
                 repo.sendMessage(partnerId, text.trim(), replyingTo = reply)
             }
+
+            replyingTo = null
+            smartSuggestions.clear()
+            isSmartReplyLoading = false
         }
-        replyingTo = null
     }
 
-    // ===== GỬI ẢNH (imageUrl) =====
     fun sendImageMessage(toId: String, imageBytes: ByteArray) {
         val reply = replyingTo
         viewModelScope.launch {
-            repo.sendImageMessage(
-                partnerId = toId,
-                bytes = imageBytes,
-                text = "",
-                replyingTo = reply
-            )
+            repo.sendImageMessage(partnerId = toId, bytes = imageBytes, text = "", replyingTo = reply)
             replyingTo = null
         }
     }
 
-    // ===== REACT EMOJI =====
     fun toggleReaction(partnerId: String, messageId: String, emoji: String) {
         viewModelScope.launch {
-            repo.toggleReaction(
-                partnerId = partnerId,
-                msgId = messageId,
-                emoji = emoji
-            )
+            repo.toggleReaction(partnerId = partnerId, msgId = messageId, emoji = emoji)
         }
     }
+
+    // ================== 5. ATTACHMENTS (MULTI IMAGE + VOICE) ==================
+    val pendingImages = mutableStateListOf<ByteArray>()
+    var pendingVoiceFile by mutableStateOf<File?>(null)
+        private set
+
+    fun addPendingImages(list: List<ByteArray>) {
+        pendingImages.addAll(list)
+    }
+
+    fun removePendingImageAt(index: Int) {
+        if (index in pendingImages.indices) pendingImages.removeAt(index)
+    }
+
+    fun clearPendingImages() {
+        pendingImages.clear()
+    }
+
+    fun attachVoiceFile(file: File) {
+        // xoá file cũ nếu có để tránh rác
+        try { pendingVoiceFile?.delete() } catch (_: Exception) {}
+        pendingVoiceFile = file
+    }
+
+    fun clearPendingVoice() {
+        try { pendingVoiceFile?.delete() } catch (_: Exception) {}
+        pendingVoiceFile = null
+    }
+
+    fun clearPendingAll() {
+        clearPendingImages()
+        clearPendingVoice()
+    }
+
+    /**
+     * Gửi bundle: text (nếu có) + voice (nếu có) + nhiều ảnh (nếu có).
+     * (Mỗi item sẽ là 1 message riêng; không đổi schema Firestore.)
+     */
+    fun sendBundle(partnerId: String, text: String) {
+        val t = text.trim()
+        val hasAnything = t.isNotBlank() || pendingVoiceFile != null || pendingImages.isNotEmpty()
+        if (!hasAnything || partnerId.isBlank()) return
+
+        val reply = replyingTo
+
+        viewModelScope.launch {
+            var usedReply = false
+            fun takeReplyOnce(): Message? {
+                return if (!usedReply) {
+                    usedReply = true
+                    reply
+                } else null
+            }
+
+            // 1) text
+            if (t.isNotBlank()) {
+                val r = takeReplyOnce()
+                if (partnerId == ChatRepository.AI_BOT_ID) {
+                    repo.sendAiMessage(text = t, replyingTo = r)
+                } else {
+                    repo.sendMessage(partnerId, t, replyingTo = r)
+                }
+            }
+
+            // 2) voice (đính kèm)
+            pendingVoiceFile?.let { f ->
+                val r = takeReplyOnce()
+                // repo.sendVoiceMessage không nhận replyingTo, nên reply chỉ áp dụng cho phần text/ảnh
+                // (Nếu bạn muốn reply cho voice thì phải mở rộng schema message)
+                repo.sendVoiceMessage(partnerId, f)
+            }
+
+            // 3) nhiều ảnh
+            if (pendingImages.isNotEmpty()) {
+                pendingImages.forEachIndexed { idx, bytes ->
+                    val r = if (idx == 0) takeReplyOnce() else null
+                    repo.sendImageMessage(partnerId = partnerId, bytes = bytes, text = "", replyingTo = r)
+                }
+            }
+
+            // clear state
+            replyingTo = null
+            smartSuggestions.clear()
+            isSmartReplyLoading = false
+            clearPendingAll()
+        }
+    }
+
+    // ================== 6. AUDIO RECORD ==================
     var isRecording by mutableStateOf(false)
         private set
 
     private var audioRecorder: AudioRecorder? = null
 
-    // Map lưu các tin nhắn đã dịch: key=msgId, value=translatedText
-    // Dùng Map để UI tự update khi có bản dịch mới
-    val translatedMessages = mutableStateMapOf<String, String>()
-
-    fun initRecorder(context: android.content.Context) {
+    fun initRecorder(context: Context) {
         if (audioRecorder == null) {
             audioRecorder = AudioRecorder(context)
         }
@@ -143,6 +261,19 @@ class ChatViewModel(
         audioRecorder?.startRecording()
     }
 
+    /**
+     * Dừng ghi âm và GẮN vào pending (không gửi ngay).
+     * Người dùng sẽ bấm Send để gửi chung với ảnh/text.
+     */
+    fun stopAndAttachRecording() {
+        isRecording = false
+        val file = audioRecorder?.stopRecording()
+        if (file != null) {
+            attachVoiceFile(file)
+        }
+    }
+
+    // (Giữ lại để không vỡ chỗ nào khác nếu còn gọi)
     fun stopAndSendRecording(partnerId: String) {
         isRecording = false
         val file = audioRecorder?.stopRecording()
@@ -153,21 +284,23 @@ class ChatViewModel(
         }
     }
 
-    // Hàm gọi AI dịch
+    // ================== 7. TRANSLATE ==================
+    val translatedMessages = mutableStateMapOf<String, String>()
+
     fun translateMessage(message: Message) {
         viewModelScope.launch {
-            // Hiện loading giả hoặc text tạm
             translatedMessages[message.id] = "Đang dịch..."
             val result = repo.translateText(message.text)
             translatedMessages[message.id] = result
         }
     }
+
+    // ================== 8. TYPING ==================
     var isPartnerTyping by mutableStateOf(false)
         private set
 
     private var typingJob: Job? = null
 
-    // Hàm gọi khi vào màn hình chat
     fun observeTyping(partnerId: String) {
         viewModelScope.launch {
             repo.listenPartnerTyping(partnerId).collect {
@@ -176,23 +309,19 @@ class ChatViewModel(
         }
     }
 
-    // Hàm gọi mỗi khi nhập liệu vào TextField
     fun onInputTextChanged(partnerId: String, newText: String) {
-        // Gửi lệnh: Đang gõ
-        if (typingJob == null) {
+        if (newText.isNotBlank() && typingJob == null) {
             viewModelScope.launch { repo.setTyping(partnerId, true) }
         }
 
-        // Hủy bộ đếm cũ, tạo bộ đếm mới
         typingJob?.cancel()
         typingJob = viewModelScope.launch {
-            delay(2000) // Sau 2 giây không gõ gì -> Tắt typing
+            delay(2000)
             repo.setTyping(partnerId, false)
             typingJob = null
         }
     }
 
-    // Đánh dấu đã đọc
     fun markRead(partnerId: String) {
         viewModelScope.launch {
             repo.markMessagesAsRead(partnerId)
