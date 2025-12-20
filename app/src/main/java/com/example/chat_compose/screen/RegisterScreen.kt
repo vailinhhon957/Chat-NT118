@@ -1,26 +1,47 @@
 package com.example.chat_compose.screen
 
+import android.app.Activity
+import android.util.Log
 import android.util.Patterns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Email
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.rounded.ChatBubble
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.chat_compose.AuthViewModel
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
+
+// COPY LẠI MÃ MÀU
+private val DarkBackground = Color(0xFF0F111E)
+private val InputBackground = Color(0xFF1F2232)
+private val PrimaryPurple = Color(0xFF7F56D9)
+private val TextWhite = Color(0xFFFFFFFF)
+private val TextGrey = Color(0xFF8E93A3)
 
 @Composable
 fun RegisterScreen(
@@ -31,203 +52,203 @@ fun RegisterScreen(
     var name by rememberSaveable { mutableStateOf("") }
     var email by rememberSaveable { mutableStateOf("") }
     var pass by rememberSaveable { mutableStateOf("") }
-    var pass2 by rememberSaveable { mutableStateOf("") }
-
     var showPass by rememberSaveable { mutableStateOf(false) }
-    var showPass2 by rememberSaveable { mutableStateOf(false) }
 
     val isLoading = authViewModel.isLoading
     val vmError = authViewModel.error
-
     var localError by remember { mutableStateOf<String?>(null) }
     val errorToShow = localError ?: vmError
 
-    var showSuccessDialog by remember { mutableStateOf(false) }
+    // --- LOGIC GOOGLE SIGN IN (COPY GIỐNG LOGIN) ---
+    val context = LocalContext.current
+    val gso = remember {
+        GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestEmail()
+            .requestIdToken("YOUR_WEB_CLIENT_ID_FROM_FIREBASE_CONSOLE")
+            .build()
+    }
+    val googleSignInClient = remember { GoogleSignIn.getClient(context, gso) }
+
+    val googleLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+            try {
+                val account = task.getResult(ApiException::class.java)
+                val idToken = account.idToken
+                if (idToken != null) {
+                    Log.d("GoogleRegister", "Token: $idToken")
+                    authViewModel.loginWithGoogle(idToken) { onRegisterSuccess() }
+                } else {
+                    localError = "Không lấy được Google Token"
+                }
+            } catch (e: ApiException) {
+                localError = "Lỗi Google: ${e.message}"
+            }
+        }
+    }
+    // ---------------------------------------------
 
     fun isValidEmail(s: String) = Patterns.EMAIL_ADDRESS.matcher(s.trim()).matches()
+
+    val bgBrush = Brush.verticalGradient(
+        colors = listOf(Color(0xFF2D2548), DarkBackground, DarkBackground)
+    )
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    colors = listOf(
-                        MaterialTheme.colorScheme.surface,
-                        MaterialTheme.colorScheme.surfaceVariant
-                    )
-                )
-            )
-            .padding(16.dp)
+            .background(bgBrush)
+            .padding(horizontal = 24.dp)
     ) {
         Column(
             modifier = Modifier
-                .align(Alignment.Center)
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(24.dp))
-                .background(MaterialTheme.colorScheme.surface)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(
-                text = "Tạo tài khoản",
-                style = MaterialTheme.typography.headlineSmall
+            Spacer(modifier = Modifier.height(60.dp))
+
+            // LOGO
+            Icon(
+                imageVector = Icons.Rounded.ChatBubble,
+                contentDescription = null,
+                tint = PrimaryPurple,
+                modifier = Modifier.size(60.dp)
             )
+            Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = "Vui lòng nhập thông tin để đăng ký",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                text = "HUYAN CHAT",
+                color = TextWhite,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.sp
             )
 
-            OutlinedTextField(
+            Spacer(modifier = Modifier.height(30.dp))
+
+            // TIÊU ĐỀ TIẾNG VIỆT
+            Text(
+                text = "Tạo Tài Khoản Mới",
+                color = TextWhite,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Tham gia cùng chúng tôi để kết nối\nvà trải nghiệm ngay hôm nay.",
+                color = TextGrey,
+                fontSize = 14.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                lineHeight = 20.sp
+            )
+
+            Spacer(modifier = Modifier.height(40.dp))
+
+            // INPUTS
+            DarkInputField(
+                label = "Tên hiển thị",
                 value = name,
-                onValueChange = {
-                    name = it
-                    localError = null
-                },
-                label = { Text("Tên hiển thị") },
-                leadingIcon = { Icon(Icons.Default.Person, contentDescription = null) },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
+                onValueChange = { name = it; localError = null },
+                placeholder = "Nguyễn Văn A",
+                imeAction = ImeAction.Next
             )
 
-            OutlinedTextField(
+            Spacer(modifier = Modifier.height(16.dp))
+
+            DarkInputField(
+                label = "Email",
                 value = email,
-                onValueChange = {
-                    email = it
-                    localError = null
-                },
-                label = { Text("Email") },
-                leadingIcon = { Icon(Icons.Default.Email, contentDescription = null) },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
+                onValueChange = { email = it; localError = null },
+                placeholder = "nguyenvan.a@example.com",
+                keyboardType = KeyboardType.Email
             )
 
-            OutlinedTextField(
+            Spacer(modifier = Modifier.height(16.dp))
+
+            DarkInputField(
+                label = "Mật khẩu",
                 value = pass,
-                onValueChange = {
-                    pass = it
-                    localError = null
-                },
-                label = { Text("Mật khẩu") },
-                leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
-                trailingIcon = {
-                    IconButton(onClick = { showPass = !showPass }) {
-                        Icon(
-                            imageVector = if (showPass) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                            contentDescription = if (showPass) "Ẩn mật khẩu" else "Hiện mật khẩu"
-                        )
-                    }
-                },
-                visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
+                onValueChange = { pass = it; localError = null },
+                placeholder = "••••••••",
+                isPassword = true,
+                isPasswordVisible = showPass,
+                onTogglePassword = { showPass = !showPass },
+                imeAction = ImeAction.Done
             )
 
-            OutlinedTextField(
-                value = pass2,
-                onValueChange = {
-                    pass2 = it
-                    localError = null
-                },
-                label = { Text("Nhập lại mật khẩu") },
-                leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
-                trailingIcon = {
-                    IconButton(onClick = { showPass2 = !showPass2 }) {
-                        Icon(
-                            imageVector = if (showPass2) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                            contentDescription = if (showPass2) "Ẩn mật khẩu" else "Hiện mật khẩu"
-                        )
-                    }
-                },
-                visualTransformation = if (showPass2) VisualTransformation.None else PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
-            )
-
-            errorToShow?.let { msg ->
-                Surface(
-                    color = MaterialTheme.colorScheme.errorContainer,
-                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = msg,
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(12.dp)
-                    )
-                }
+            if (errorToShow != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(text = errorToShow, color = Color.Red, fontSize = 12.sp)
             }
 
+            Spacer(modifier = Modifier.height(30.dp))
+
+            // BUTTON ĐĂNG KÝ
             Button(
                 onClick = {
                     val n = name.trim()
                     val e = email.trim()
 
-                    if (n.isBlank() || e.isBlank() || pass.isBlank() || pass2.isBlank()) {
+                    if (n.isBlank() || e.isBlank() || pass.isBlank()) {
                         localError = "Vui lòng nhập đầy đủ thông tin"
                         return@Button
                     }
                     if (!isValidEmail(e)) {
-                        localError = "Email không hợp lệ"
+                        localError = "Email không đúng định dạng"
                         return@Button
                     }
                     if (pass.length < 6) {
-                        localError = "Mật khẩu phải có ít nhất 6 ký tự"
-                        return@Button
-                    }
-                    if (pass != pass2) {
-                        localError = "Mật khẩu nhập lại không khớp"
+                        localError = "Mật khẩu quá ngắn (tối thiểu 6 ký tự)"
                         return@Button
                     }
 
-                    localError = null
-
-                    authViewModel.register(e, pass, n) {
-                        // Hiện dialog thông báo thành công rồi mới về Login
-                        showSuccessDialog = true
-                    }
+                    authViewModel.register(e, pass, n) { onRegisterSuccess() }
                 },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
-                enabled = !isLoading,
-                shape = RoundedCornerShape(14.dp)
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryPurple),
+                shape = RoundedCornerShape(30.dp),
+                enabled = !isLoading
             ) {
                 if (isLoading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary
-                    )
+                    CircularProgressIndicator(color = Color.White, modifier = Modifier.size(20.dp))
                 } else {
-                    Text("Tạo tài khoản")
+                    Text("Đăng Ký", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
 
-            TextButton(
-                onClick = onBack,
-                modifier = Modifier.align(Alignment.End),
-                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)
-            ) {
-                Text("Đã có tài khoản? Đăng nhập")
-            }
-        }
-    }
+            // ĐÃ XÓA PHẦN REMEMBER ME & FORGOT PASSWORD Ở ĐÂY
 
-    if (showSuccessDialog) {
-        AlertDialog(
-            onDismissRequest = { /* không cho dismiss ngoài */ },
-            title = { Text("Đăng ký thành công") },
-            text = { Text("Bạn đã tạo tài khoản thành công. Bây giờ hãy đăng nhập.") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showSuccessDialog = false
-                        onRegisterSuccess() // bạn điều hướng về Login ở đây
-                    }
-                ) { Text("OK") }
+            Spacer(modifier = Modifier.height(30.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Divider(modifier = Modifier.weight(1f), color = Color(0xFF2A2E3E))
+                Text("Hoặc", color = TextGrey, modifier = Modifier.padding(horizontal = 16.dp))
+                Divider(modifier = Modifier.weight(1f), color = Color(0xFF2A2E3E))
             }
-        )
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            SocialLoginButton(text = "Đăng ký bằng Google", iconRes = "G") {
+                localError = null
+                googleLauncher.launch(googleSignInClient.signInIntent)
+            }
+
+            Spacer(modifier = Modifier.height(40.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Đã có tài khoản? ", color = TextGrey)
+                Text(
+                    text = "Đăng nhập",
+                    color = PrimaryPurple,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.clickable { onBack() }
+                )
+            }
+            Spacer(modifier = Modifier.height(20.dp))
+        }
     }
 }

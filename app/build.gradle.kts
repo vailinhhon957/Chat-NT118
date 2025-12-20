@@ -91,4 +91,5 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended:1.5.4")
     implementation("com.google.mlkit:image-labeling:17.0.7")
     implementation("com.google.mlkit:smart-reply:17.0.4")
+    implementation("com.google.android.gms:play-services-auth:20.7.0")
 }

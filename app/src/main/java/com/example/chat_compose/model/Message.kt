@@ -21,5 +21,6 @@ data class Message(
     val imageBytes: ByteArray? = null,
     val audioUrl: String? = null,        // Link file ghi âm
     var translatedText: String? = null,
-    val status: MessageStatus = MessageStatus.SENT
+    val status: MessageStatus = MessageStatus.SENT,
+    val expiryTime: Long? = null
 )

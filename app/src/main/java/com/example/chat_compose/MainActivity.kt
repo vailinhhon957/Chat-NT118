@@ -303,11 +303,12 @@ fun ChatApp(
 
         composable(route = Screen.Settings.route) {
             SettingScreen(
+                authViewModel = authViewModel, // <--- THÊM DÒNG NÀY (truyền biến authViewModel vào)
                 onBack = { navController.popBackStack() },
                 onLogout = {
                     // Điều hướng về login và xoá stack (tránh bấm back quay lại home)
-                    navController.navigate(Screen.Login.route) {
-                        popUpTo(Screen.Home.route) { inclusive = true }
+                    navController.navigate(route = Screen.Login.route) {
+                        popUpTo(route = Screen.Home.route) { inclusive = true }
                         launchSingleTop = true
                     }
                 }

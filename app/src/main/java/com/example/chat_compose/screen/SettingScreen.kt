@@ -33,10 +33,12 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import com.example.chat_compose.AuthViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingScreen(
+    authViewModel: AuthViewModel,
     onBack: () -> Unit,
     onLogout: () -> Unit
 ) {
@@ -290,6 +292,7 @@ fun SettingScreen(
             confirmButton = {
                 TextButton(onClick = {
                     showLogoutConfirm = false
+                    authViewModel.logout()
                     onLogout()
                 }) { Text("Đăng xuất") }
             },

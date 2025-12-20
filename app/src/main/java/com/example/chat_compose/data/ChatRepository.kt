@@ -21,6 +21,11 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
 import java.io.File
+import com.google.firebase.auth.GoogleAuthProvider
+import com.google.firebase.auth.FirebaseUser
+import com.google.firebase.ktx.Firebase
+import com.google.firebase.firestore.ktx.firestore
+
 
 class ChatRepository(
     private val auth: FirebaseAuth = FirebaseAuth.getInstance(),
@@ -304,11 +309,11 @@ class ChatRepository(
         batch.commit().await()
     }
 
-    suspend fun sendMessage(partnerId: String, text: String, replyingTo: Message? = null) {
+    suspend fun sendMessage(partnerId: String, text: String, replyingTo: Message? = null, isEphemeral: Boolean = false) {
         val myUid = currentUserId() ?: return
         val cid = chatId(myUid, partnerId)
         val msgDoc = db.collection("chats").document(cid).collection("messages").document()
-
+        val expiryTime = if (isEphemeral) System.currentTimeMillis() + (10 * 60 * 1000) else null
         val data = hashMapOf(
             "id" to msgDoc.id,
             "fromId" to myUid,
@@ -474,7 +479,7 @@ class ChatRepository(
         val reactions = (doc.get("reactions") as? Map<*, *>)?.mapNotNull { (k, v) ->
             if (k is String && v is String) k to v else null
         }?.toMap() ?: emptyMap()
-
+        val expiryTime = doc.getLong("expiryTime")
         val statusStr = doc.getString("status") ?: "SENT"
         val status = try { MessageStatus.valueOf(statusStr) } catch (_: Exception) { MessageStatus.SENT }
 
@@ -489,7 +494,8 @@ class ChatRepository(
             imageBytes = imageBytes,
             audioUrl = doc.getString("audioUrl"),
             reactions = reactions,
-            status = status
+            status = status,
+            expiryTime = expiryTime
         )
     }
 
@@ -544,14 +550,37 @@ class ChatRepository(
         }
 
         val cid = chatId(myUid, partnerId)
-        val reg = db.collection("chats").document(cid).collection("messages")
+
+        val reg = db.collection("chats").document(cid)
+            .collection("messages")
             .orderBy("createdAt", Query.Direction.ASCENDING)
             .addSnapshotListener { snap, _ ->
-                if (snap != null) {
-                    trySend(snap.documents.map { docToMessage(it) })
-                } else {
+                if (snap == null) {
                     trySend(emptyList())
+                    return@addSnapshotListener
                 }
+                val currentTime = System.currentTimeMillis()
+                val validMessages = mutableListOf<Message>()
+                for (doc in snap.documents) {
+                    val msg = docToMessage(doc)
+
+                    // === LOGIC TỰ HỦY ===
+
+                    if (msg.expiryTime != null && currentTime > msg.expiryTime) {
+                        // 1. Xóa vĩnh viễn trên Firestore (để máy đối phương cũng mất)
+                        db.collection("chats").document(cid)
+                            .collection("messages").document(msg.id)
+                            .delete()
+                            .addOnFailureListener { e ->
+                                android.util.Log.e("ChatRepo", "Lỗi xóa tin hết hạn: ${e.message}")
+                            }
+                    } else {
+
+                        validMessages.add(msg)
+                    }
+                }
+
+                trySend(validMessages)
             }
 
         awaitClose { reg.remove() }
@@ -628,6 +657,50 @@ class ChatRepository(
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+    suspend fun deleteMessage(partnerId: String, msgId: String) {
+        val myUid = currentUserId() ?: return
+        val cid = chatId(myUid, partnerId)
+        // Xóa document trong Firestore
+        try {
+            db.collection("chats").document(cid)
+                .collection("messages").document(msgId)
+                .delete()
+                .await()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+    suspend fun loginWithGoogle(idToken: String): Result<FirebaseUser?> {
+        return try {
+            val credential = GoogleAuthProvider.getCredential(idToken, null)
+            val authResult = auth.signInWithCredential(credential).await()
+            Result.success(authResult.user)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // 2. Hàm tạo user Firestore nếu chưa có (dành cho người lần đầu login Google)
+    suspend fun createFirestoreUserIfNeed(uid: String, email: String?, name: String?) {
+        val docRef = db.collection("users").document(uid)
+        val snapshot = docRef.get().await()
+
+        if (!snapshot.exists()) {
+            val userMap = hashMapOf(
+                "uid" to uid,                          // Sửa 'userId' thành 'uid'
+                "displayName" to (name ?: "No Name"),  // Sửa 'name' thành 'displayName'
+                "email" to (email ?: ""),
+                "avatarBase64" to null,                // Sửa 'imageUrl' thành 'avatarBase64' (để null mặc định)
+                "isOnline" to true,
+                "lastSeen" to FieldValue.serverTimestamp(), // Dùng serverTimestamp chuẩn hơn
+                "fcmToken" to null
+            )
+            docRef.set(userMap).await()
+
+            // Đồng bộ token ngay sau khi tạo
+            runCatching { syncFcmToken() }
         }
     }
 }

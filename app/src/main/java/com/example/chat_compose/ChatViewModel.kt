@@ -16,6 +16,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import com.example.chat_compose.data.GeminiAiRepository
 
 class ChatViewModel(
     private val repo: ChatRepository = ChatRepository()
@@ -36,7 +37,11 @@ class ChatViewModel(
             }
         }
     }
-
+    var isEphemeralMode by mutableStateOf(false) // Mặc định tắt
+        private set
+    fun toggleEphemeralMode() {
+        isEphemeralMode = !isEphemeralMode
+    }
     // ================== 2. CHAT STATE ==================
     var messages by mutableStateOf<List<Message>>(emptyList())
         private set
@@ -129,18 +134,16 @@ class ChatViewModel(
     fun sendMessage(partnerId: String, text: String) {
         if (text.isBlank()) return
         val reply = replyingTo
+        val sendingMode = isEphemeralMode
 
         viewModelScope.launch {
             if (partnerId == ChatRepository.AI_BOT_ID) {
                 repo.sendAiMessage(text = text.trim(), replyingTo = reply)
             } else {
-                repo.sendMessage(partnerId, text.trim(), replyingTo = reply)
+                repo.sendMessage(partnerId, text.trim(), replyingTo = reply, isEphemeral = sendingMode)
             }
-
-            replyingTo = null
-            smartSuggestions.clear()
-            isSmartReplyLoading = false
         }
+        replyingTo = null
     }
 
     fun sendImageMessage(toId: String, imageBytes: ByteArray) {
@@ -148,6 +151,11 @@ class ChatViewModel(
         viewModelScope.launch {
             repo.sendImageMessage(partnerId = toId, bytes = imageBytes, text = "", replyingTo = reply)
             replyingTo = null
+        }
+    }
+    fun deleteMessage(partnerId: String, msgId: String) {
+        viewModelScope.launch {
+            repo.deleteMessage(partnerId, msgId)
         }
     }
 
@@ -325,6 +333,30 @@ class ChatViewModel(
     fun markRead(partnerId: String) {
         viewModelScope.launch {
             repo.markMessagesAsRead(partnerId)
+        }
+    }
+
+    var currentSentiment by mutableStateOf("NEUTRAL")
+        private set
+    private val aiRepo = GeminiAiRepository()
+    fun analyzeLastMessageSentiment() {
+        viewModelScope.launch {
+            // Lấy tin nhắn cuối cùng
+            val lastMsg = messages.lastOrNull() ?: return@launch
+
+            // Chỉ phân tích nếu là tin nhắn của ĐỐI PHƯƠNG (Partner)
+            // Vì mình muốn giao diện phản ứng theo cảm xúc của họ
+            val myId = repo.currentUserId()
+            if (lastMsg.fromId != myId && lastMsg.text.isNotBlank()) {
+
+                // Gọi AI (Giả sử bạn đã khởi tạo aiRepo trong ViewModel)
+                val sentiment = aiRepo.analyzeSentiment(lastMsg.text)
+
+                // Cập nhật UI
+                if (sentiment in listOf("HAPPY", "SAD", "ANGRY", "LOVE", "NEUTRAL")) {
+                    currentSentiment = sentiment
+                }
+            }
         }
     }
 }
