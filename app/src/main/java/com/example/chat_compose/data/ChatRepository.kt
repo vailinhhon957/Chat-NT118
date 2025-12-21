@@ -9,6 +9,8 @@ import com.example.chat_compose.model.MessageStatus
 import com.example.chat_compose.model.ProfileExtras
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseUser
+import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreSettings
@@ -21,11 +23,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
 import java.io.File
-import com.google.firebase.auth.GoogleAuthProvider
-import com.google.firebase.auth.FirebaseUser
-import com.google.firebase.ktx.Firebase
-import com.google.firebase.firestore.ktx.firestore
-
+import java.util.Date
 
 class ChatRepository(
     private val auth: FirebaseAuth = FirebaseAuth.getInstance(),
@@ -36,6 +34,9 @@ class ChatRepository(
         const val AI_BOT_ID = "AI_BOT"
         const val AI_BOT_NAME = "HuyAn AI"
         const val AI_BOT_EMAIL = "bot@huyan.ai"
+
+        // ==== GROUP ====
+        const val GROUP_ID_PREFIX = "group_"
     }
 
     private val aiRepo = GeminiAiRepository()
@@ -49,6 +50,8 @@ class ChatRepository(
     }
 
     fun currentUserId(): String? = auth.currentUser?.uid
+
+    private fun isGroupId(id: String): Boolean = id.startsWith(GROUP_ID_PREFIX)
 
     // ================= AUTH =================
     suspend fun register(email: String, password: String, name: String): Result<Unit> {
@@ -115,10 +118,6 @@ class ChatRepository(
     }
 
     // ================= PASSWORD & EMAIL =================
-    /**
-     * Reset mật khẩu qua email (dùng callback như AuthViewModel đang gọi).
-     * Ví dụ: repo.resetPassword(email) { result -> ... }
-     */
     fun resetPassword(email: String, cb: (Result<Unit>) -> Unit) {
         auth.sendPasswordResetEmail(email.trim())
             .addOnSuccessListener { cb(Result.success(Unit)) }
@@ -144,6 +143,11 @@ class ChatRepository(
                 lastSeen = null,
                 avatarBytes = null
             )
+        }
+
+        // Group profile (tái sử dụng ChatUser để hiển thị nhóm)
+        if (isGroupId(uid)) {
+            return getGroupAsChatUser(uid)
         }
 
         return try {
@@ -183,6 +187,31 @@ class ChatRepository(
             return@callbackFlow
         }
 
+        if (isGroupId(uid)) {
+            val reg = db.collection("groups").document(uid)
+                .addSnapshotListener { snap, _ ->
+                    if (snap == null || !snap.exists()) {
+                        trySend(null)
+                        return@addSnapshotListener
+                    }
+                    val name = snap.getString("name") ?: "Nhóm"
+                    val lastPreview = snap.getString("lastMessage") ?: ""
+                    val updatedAt = snap.getTimestamp("lastUpdatedAt")?.toDate()
+                    trySend(
+                        ChatUser(
+                            uid = uid,
+                            email = lastPreview,
+                            displayName = name,
+                            isOnline = false,
+                            lastSeen = updatedAt,
+                            avatarBytes = null
+                        )
+                    )
+                }
+            awaitClose { reg.remove() }
+            return@callbackFlow
+        }
+
         val reg = db.collection("users").document(uid)
             .addSnapshotListener { snap, _ ->
                 if (snap == null || !snap.exists()) {
@@ -209,6 +238,14 @@ class ChatRepository(
         awaitClose { reg.remove() }
     }
 
+    /**
+     * Trả về danh sách "cuộc trò chuyện" để Home hiển thị:
+     * - Bot
+     * - User (trừ mình)
+     * - Group mà mình là member
+     *
+     * Giữ tên hàm listenFriends để không làm vỡ code cũ.
+     */
     fun listenFriends(myUid: String): Flow<List<ChatUser>> = callbackFlow {
         val bot = ChatUser(
             uid = AI_BOT_ID,
@@ -219,14 +256,28 @@ class ChatRepository(
             avatarBytes = null
         )
 
-        val reg = db.collection("users")
+        var latestUsers: List<ChatUser> = emptyList()
+        var latestGroups: List<ChatUser> = emptyList()
+
+        fun emit() {
+            // Bot luôn đứng đầu
+            val merged = buildList {
+                add(bot)
+                addAll(latestGroups)
+                addAll(latestUsers.filter { it.uid != AI_BOT_ID })
+            }
+            trySend(merged)
+        }
+
+        val usersReg = db.collection("users")
             .addSnapshotListener { snap, _ ->
                 if (snap == null) {
-                    trySend(listOf(bot))
+                    latestUsers = emptyList()
+                    emit()
                     return@addSnapshotListener
                 }
 
-                val users = snap.documents
+                latestUsers = snap.documents
                     .filter { it.id != myUid }
                     .mapNotNull { doc ->
                         val avatarBytes = doc.getString("avatarBase64")?.let {
@@ -243,10 +294,96 @@ class ChatRepository(
                         )
                     }
 
-                trySend(listOf(bot) + users.filter { it.uid != AI_BOT_ID })
+                emit()
             }
 
-        awaitClose { reg.remove() }
+        val groupsReg = db.collection("groups")
+            .whereArrayContains("members", myUid)
+            .addSnapshotListener { snap, _ ->
+                if (snap == null) {
+                    latestGroups = emptyList()
+                    emit()
+                    return@addSnapshotListener
+                }
+
+                latestGroups = snap.documents.map { doc ->
+                    val name = doc.getString("name") ?: "Nhóm"
+                    val lastPreview = doc.getString("lastMessage") ?: ""
+                    val updatedAt = doc.getTimestamp("lastUpdatedAt")?.toDate()
+
+                    ChatUser(
+                        uid = doc.id,
+                        email = lastPreview,          // dùng email làm "preview" cho Home
+                        displayName = name,
+                        isOnline = false,
+                        lastSeen = updatedAt,
+                        avatarBytes = null
+                    )
+                }.sortedByDescending { it.lastSeen?.time ?: 0L }
+
+                emit()
+            }
+
+        awaitClose {
+            usersReg.remove()
+            groupsReg.remove()
+        }
+    }
+
+    // ================= GROUP APIs =================
+
+    /**
+     * Tạo nhóm:
+     * groups/{groupId}:
+     *  - name: String
+     *  - members: [uid]
+     *  - createdAt, lastUpdatedAt
+     *  - lastMessage: String (preview)
+     */
+    suspend fun createGroup(name: String, memberIds: List<String>): Result<String> {
+        val myUid = currentUserId() ?: return Result.failure(Exception("Chưa đăng nhập"))
+        val cleanName = name.trim()
+        if (cleanName.isBlank()) return Result.failure(Exception("Tên nhóm trống"))
+
+        val members = (memberIds + myUid).distinct()
+        val doc = db.collection("groups").document()
+        val groupId = GROUP_ID_PREFIX + doc.id
+
+        return try {
+            val data = mapOf(
+                "id" to groupId,
+                "name" to cleanName,
+                "members" to members,
+                "createdAt" to FieldValue.serverTimestamp(),
+                "lastUpdatedAt" to FieldValue.serverTimestamp(),
+                "lastMessage" to ""
+            )
+            // Lưu đúng document id = groupId
+            db.collection("groups").document(groupId).set(data).await()
+            Result.success(groupId)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun getGroupAsChatUser(groupId: String): ChatUser? {
+        return try {
+            val doc = db.collection("groups").document(groupId).get().await()
+            if (!doc.exists()) return null
+            val name = doc.getString("name") ?: "Nhóm"
+            val lastPreview = doc.getString("lastMessage") ?: ""
+            val updatedAt = doc.getTimestamp("lastUpdatedAt")?.toDate()
+            ChatUser(
+                uid = groupId,
+                email = lastPreview,
+                displayName = name,
+                isOnline = false,
+                lastSeen = updatedAt,
+                avatarBytes = null
+            )
+        } catch (_: Exception) {
+            null
+        }
     }
 
     // ================= CHAT LOGIC =================
@@ -259,6 +396,18 @@ class ChatRepository(
     // 1. TYPING
     suspend fun setTyping(partnerId: String, isTyping: Boolean) {
         val myUid = currentUserId() ?: return
+
+        // typing group: groups/{gid} (optional)
+        if (isGroupId(partnerId)) {
+            val data = mapOf<String, Any>("typing_$myUid" to isTyping)
+            runCatching {
+                db.collection("groups").document(partnerId)
+                    .set(data, SetOptions.merge())
+                    .await()
+            }
+            return
+        }
+
         val cid = chatId(myUid, partnerId)
         val data = mapOf<String, Any>("typing_$myUid" to isTyping)
         runCatching {
@@ -277,6 +426,21 @@ class ChatRepository(
             return@callbackFlow
         }
 
+        if (isGroupId(partnerId)) {
+            val reg = db.collection("groups").document(partnerId)
+                .addSnapshotListener { snap, _ ->
+                    // partnerId là group, nên chỉ trả về typing tổng quát:
+                    // nếu bất kỳ typing_* nào true thì true.
+                    val anyTyping = snap?.data
+                        ?.filterKeys { it.startsWith("typing_") }
+                        ?.values
+                        ?.any { it == true } == true
+                    trySend(anyTyping)
+                }
+            awaitClose { reg.remove() }
+            return@callbackFlow
+        }
+
         val cid = chatId(myUid, partnerId)
         val reg = db.collection("chats").document(cid)
             .addSnapshotListener { snap, _ ->
@@ -291,6 +455,13 @@ class ChatRepository(
     // 3. MARK READ
     suspend fun markMessagesAsRead(partnerId: String) {
         val myUid = currentUserId() ?: return
+
+        // Group: mark read theo user -> dùng field per-user (đơn giản: bỏ qua nếu bạn chưa cần)
+        if (isGroupId(partnerId)) {
+            // Nếu bạn muốn “đã đọc” trong group: cần schema readBy/lastReadAt theo user.
+            return
+        }
+
         val cid = chatId(myUid, partnerId)
 
         val query = db.collection("chats").document(cid)
@@ -309,23 +480,69 @@ class ChatRepository(
         batch.commit().await()
     }
 
-    suspend fun sendMessage(partnerId: String, text: String, replyingTo: Message? = null, isEphemeral: Boolean = false) {
+    /**
+     * sendMessage:
+     * - 1-1: chats/{chatId}/messages
+     * - group: groups/{groupId}/messages
+     */
+    suspend fun sendMessage(
+        partnerId: String,
+        text: String,
+        replyingTo: Message? = null,
+        isEphemeral: Boolean = false
+    ) {
         val myUid = currentUserId() ?: return
+        val cleanText = text.trim()
+        if (cleanText.isBlank()) return
+
+        val expiryTime = if (isEphemeral) System.currentTimeMillis() + (10 * 60 * 1000) else null
+
+        if (isGroupId(partnerId)) {
+            val msgDoc = db.collection("groups").document(partnerId).collection("messages").document()
+            val data = hashMapOf<String, Any?>(
+                "id" to msgDoc.id,
+                "fromId" to myUid,
+                "toId" to partnerId, // groupId
+                "text" to cleanText,
+                "createdAt" to FieldValue.serverTimestamp(),
+                "replyToId" to replyingTo?.id,
+                "replyPreview" to replyingTo?.text,
+                "imageBase64" to null,
+                "audioUrl" to null,
+                "reactions" to emptyMap<String, String>(),
+                "status" to "SENT",
+                "expiryTime" to expiryTime
+            )
+            msgDoc.set(data).await()
+
+            // cập nhật preview cho Home
+            db.collection("groups").document(partnerId)
+                .set(
+                    mapOf(
+                        "lastMessage" to cleanText,
+                        "lastUpdatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                )
+                .await()
+            return
+        }
+
         val cid = chatId(myUid, partnerId)
         val msgDoc = db.collection("chats").document(cid).collection("messages").document()
-        val expiryTime = if (isEphemeral) System.currentTimeMillis() + (10 * 60 * 1000) else null
-        val data = hashMapOf(
+        val data = hashMapOf<String, Any?>(
             "id" to msgDoc.id,
             "fromId" to myUid,
             "toId" to partnerId,
-            "text" to text,
+            "text" to cleanText,
             "createdAt" to FieldValue.serverTimestamp(),
             "replyToId" to replyingTo?.id,
             "replyPreview" to replyingTo?.text,
             "imageBase64" to null,
             "audioUrl" to null,
             "reactions" to emptyMap<String, String>(),
-            "status" to "SENT"
+            "status" to "SENT",
+            "expiryTime" to expiryTime
         )
 
         msgDoc.set(data).await()
@@ -339,10 +556,39 @@ class ChatRepository(
         replyingTo: Message? = null
     ) {
         val myUid = currentUserId() ?: return
-        val cid = chatId(myUid, partnerId)
-        val msgDoc = db.collection("chats").document(cid).collection("messages").document()
         val imgB64 = Base64.encodeToString(bytes, Base64.DEFAULT)
 
+        if (isGroupId(partnerId)) {
+            val msgDoc = db.collection("groups").document(partnerId).collection("messages").document()
+            val data = hashMapOf<String, Any?>(
+                "id" to msgDoc.id,
+                "fromId" to myUid,
+                "toId" to partnerId,
+                "text" to text,
+                "createdAt" to FieldValue.serverTimestamp(),
+                "replyToId" to replyingTo?.id,
+                "replyPreview" to replyingTo?.text,
+                "imageBase64" to imgB64,
+                "audioUrl" to null,
+                "reactions" to emptyMap<String, String>(),
+                "status" to "SENT"
+            )
+            msgDoc.set(data).await()
+
+            db.collection("groups").document(partnerId)
+                .set(
+                    mapOf(
+                        "lastMessage" to if (text.isBlank()) "[Ảnh]" else text,
+                        "lastUpdatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                )
+                .await()
+            return
+        }
+
+        val cid = chatId(myUid, partnerId)
+        val msgDoc = db.collection("chats").document(cid).collection("messages").document()
         val data = hashMapOf<String, Any?>(
             "id" to msgDoc.id,
             "fromId" to myUid,
@@ -367,15 +613,43 @@ class ChatRepository(
     // --- GỬI VOICE (HỖ TRỢ AI) ---
     suspend fun sendVoiceMessage(partnerId: String, audioFile: File) {
         val myUid = currentUserId() ?: return
-        val cid = chatId(myUid, partnerId)
-        val msgDoc = db.collection("chats").document(cid).collection("messages").document()
 
-        val audioRef = storageRef.child("chat_audio/${msgDoc.id}.mp3")
+        val audioRef = storageRef.child("chat_audio/${System.currentTimeMillis()}_${audioFile.name}")
         val uri = Uri.fromFile(audioFile)
         audioRef.putFile(uri).await()
         val downloadUrl = audioRef.downloadUrl.await().toString()
 
-        val data = hashMapOf(
+        if (isGroupId(partnerId)) {
+            val msgDoc = db.collection("groups").document(partnerId).collection("messages").document()
+            val data = hashMapOf<String, Any?>(
+                "id" to msgDoc.id,
+                "fromId" to myUid,
+                "toId" to partnerId,
+                "text" to "",
+                "audioUrl" to downloadUrl,
+                "createdAt" to FieldValue.serverTimestamp(),
+                "imageBase64" to null,
+                "reactions" to emptyMap<String, String>(),
+                "status" to "SENT"
+            )
+            msgDoc.set(data).await()
+
+            db.collection("groups").document(partnerId)
+                .set(
+                    mapOf(
+                        "lastMessage" to "[Voice]",
+                        "lastUpdatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                )
+                .await()
+            return
+        }
+
+        val cid = chatId(myUid, partnerId)
+        val msgDoc = db.collection("chats").document(cid).collection("messages").document()
+
+        val data = hashMapOf<String, Any?>(
             "id" to msgDoc.id,
             "fromId" to myUid,
             "toId" to partnerId,
@@ -479,6 +753,7 @@ class ChatRepository(
         val reactions = (doc.get("reactions") as? Map<*, *>)?.mapNotNull { (k, v) ->
             if (k is String && v is String) k to v else null
         }?.toMap() ?: emptyMap()
+
         val expiryTime = doc.getLong("expiryTime")
         val statusStr = doc.getString("status") ?: "SENT"
         val status = try { MessageStatus.valueOf(statusStr) } catch (_: Exception) { MessageStatus.SENT }
@@ -499,49 +774,6 @@ class ChatRepository(
         )
     }
 
-    // ================= SMART REPLY =================
-    suspend fun generateSmartReplies(
-        partnerId: String,
-        partnerName: String? = null,
-        recentMessages: List<Message>
-    ): List<String> {
-        if (partnerId.isBlank() || partnerId == AI_BOT_ID) return emptyList()
-
-        val history = recentMessages
-            .filter { it.text.isNotBlank() && it.imageBytes == null && it.audioUrl == null }
-            .takeLast(12)
-
-        if (history.isEmpty()) return emptyList()
-
-        return try {
-            val prompt = buildString {
-                append("Hãy đề xuất đúng 3 câu trả lời ngắn, tự nhiên bằng tiếng Việt cho tin nhắn cuối cùng.\n")
-                append("Mỗi câu <= 12 từ. Không emoji. Không đánh số. Không bullet.\n")
-                if (!partnerName.isNullOrBlank()) append("Tên người kia: ").append(partnerName).append("\n")
-                append("Chỉ trả về đúng 3 dòng, mỗi dòng 1 gợi ý.")
-            }
-
-            val raw = aiRepo.replyWithMedia(history, prompt, null, null).trim()
-
-            raw.replace("\r", "\n").lines()
-                .flatMap { it.split("|", "•", ";").map { s -> s.trim() } }
-                .map { it.replace(Regex("^[-•\\d\\).:]+\\s*"), "").trim() }
-                .filter { it.isNotBlank() }
-                .distinct()
-                .take(3)
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
-
-    suspend fun translateText(text: String): String {
-        return try {
-            aiRepo.replyWithMedia(emptyList(), "Dịch sang Tiếng Việt: \"$text\"", null, null).trim()
-        } catch (e: Exception) {
-            "Lỗi dịch: ${e.message}"
-        }
-    }
-
     fun listenMessages(partnerId: String): Flow<List<Message>> = callbackFlow {
         val myUid = currentUserId() ?: run {
             trySend(emptyList())
@@ -549,6 +781,42 @@ class ChatRepository(
             return@callbackFlow
         }
 
+        // ===== GROUP =====
+        if (isGroupId(partnerId)) {
+            val reg = db.collection("groups").document(partnerId)
+                .collection("messages")
+                .orderBy("createdAt", Query.Direction.ASCENDING)
+                .addSnapshotListener { snap, _ ->
+                    if (snap == null) {
+                        trySend(emptyList())
+                        return@addSnapshotListener
+                    }
+
+                    val currentTime = System.currentTimeMillis()
+                    val valid = mutableListOf<Message>()
+
+                    for (doc in snap.documents) {
+                        val msg = docToMessage(doc)
+                        if (msg.expiryTime != null && currentTime > msg.expiryTime) {
+                            db.collection("groups").document(partnerId)
+                                .collection("messages").document(msg.id)
+                                .delete()
+                                .addOnFailureListener { e ->
+                                    Log.e("ChatRepo", "Lỗi xóa tin hết hạn (group): ${e.message}")
+                                }
+                        } else {
+                            valid.add(msg)
+                        }
+                    }
+
+                    trySend(valid)
+                }
+
+            awaitClose { reg.remove() }
+            return@callbackFlow
+        }
+
+        // ===== 1-1 =====
         val cid = chatId(myUid, partnerId)
 
         val reg = db.collection("chats").document(cid)
@@ -564,18 +832,14 @@ class ChatRepository(
                 for (doc in snap.documents) {
                     val msg = docToMessage(doc)
 
-                    // === LOGIC TỰ HỦY ===
-
                     if (msg.expiryTime != null && currentTime > msg.expiryTime) {
-                        // 1. Xóa vĩnh viễn trên Firestore (để máy đối phương cũng mất)
                         db.collection("chats").document(cid)
                             .collection("messages").document(msg.id)
                             .delete()
                             .addOnFailureListener { e ->
-                                android.util.Log.e("ChatRepo", "Lỗi xóa tin hết hạn: ${e.message}")
+                                Log.e("ChatRepo", "Lỗi xóa tin hết hạn: ${e.message}")
                             }
                     } else {
-
                         validMessages.add(msg)
                     }
                 }
@@ -588,17 +852,25 @@ class ChatRepository(
 
     suspend fun toggleReaction(partnerId: String, msgId: String, emoji: String) {
         val myUid = currentUserId() ?: return
-        val cid = chatId(myUid, partnerId)
-        val ref = db.collection("chats").document(cid).collection("messages").document(msgId)
+
+        val (colRef, docRef) =
+            if (isGroupId(partnerId)) {
+                val ref = db.collection("groups").document(partnerId).collection("messages").document(msgId)
+                "groups" to ref
+            } else {
+                val cid = chatId(myUid, partnerId)
+                val ref = db.collection("chats").document(cid).collection("messages").document(msgId)
+                "chats" to ref
+            }
 
         db.runTransaction { tr ->
-            val snap = tr.get(ref)
+            val snap = tr.get(docRef)
             val reactions = (snap.get("reactions") as? Map<String, String>)
                 ?.toMutableMap()
                 ?: mutableMapOf()
 
             if (reactions[myUid] == emoji) reactions.remove(myUid) else reactions[myUid] = emoji
-            tr.update(ref, "reactions", reactions)
+            tr.update(docRef, "reactions", reactions)
         }.await()
     }
 
@@ -622,6 +894,7 @@ class ChatRepository(
         user.reauthenticate(EmailAuthProvider.getCredential(email, oldP)).await()
         user.updatePassword(newP).await()
     }
+
     suspend fun updateAvatar(avatarBytes: ByteArray): Result<Unit> {
         val uid = currentUserId() ?: return Result.failure(Exception("Chưa đăng nhập"))
         return try {
@@ -641,7 +914,6 @@ class ChatRepository(
         }
     }
 
-    /** Xoá avatar (set null) */
     suspend fun clearAvatar(): Result<Unit> {
         val uid = currentUserId() ?: return Result.failure(Exception("Chưa đăng nhập"))
         return try {
@@ -659,11 +931,20 @@ class ChatRepository(
             Result.failure(e)
         }
     }
+
     suspend fun deleteMessage(partnerId: String, msgId: String) {
         val myUid = currentUserId() ?: return
-        val cid = chatId(myUid, partnerId)
-        // Xóa document trong Firestore
+
         try {
+            if (isGroupId(partnerId)) {
+                db.collection("groups").document(partnerId)
+                    .collection("messages").document(msgId)
+                    .delete()
+                    .await()
+                return
+            }
+
+            val cid = chatId(myUid, partnerId)
             db.collection("chats").document(cid)
                 .collection("messages").document(msgId)
                 .delete()
@@ -672,6 +953,7 @@ class ChatRepository(
             e.printStackTrace()
         }
     }
+
     suspend fun loginWithGoogle(idToken: String): Result<FirebaseUser?> {
         return try {
             val credential = GoogleAuthProvider.getCredential(idToken, null)
@@ -682,25 +964,89 @@ class ChatRepository(
         }
     }
 
-    // 2. Hàm tạo user Firestore nếu chưa có (dành cho người lần đầu login Google)
     suspend fun createFirestoreUserIfNeed(uid: String, email: String?, name: String?) {
         val docRef = db.collection("users").document(uid)
         val snapshot = docRef.get().await()
 
         if (!snapshot.exists()) {
             val userMap = hashMapOf(
-                "uid" to uid,                          // Sửa 'userId' thành 'uid'
-                "displayName" to (name ?: "No Name"),  // Sửa 'name' thành 'displayName'
+                "uid" to uid,
+                "displayName" to (name ?: "No Name"),
                 "email" to (email ?: ""),
-                "avatarBase64" to null,                // Sửa 'imageUrl' thành 'avatarBase64' (để null mặc định)
+                "avatarBase64" to null,
                 "isOnline" to true,
-                "lastSeen" to FieldValue.serverTimestamp(), // Dùng serverTimestamp chuẩn hơn
+                "lastSeen" to FieldValue.serverTimestamp(),
                 "fcmToken" to null
             )
             docRef.set(userMap).await()
-
-            // Đồng bộ token ngay sau khi tạo
             runCatching { syncFcmToken() }
         }
     }
+    suspend fun generateSmartReplies(
+        partnerId: String,
+        partnerName: String?,
+        recentMessages: List<Message>
+    ): List<String> {
+        if (recentMessages.isEmpty()) return emptyList()
+
+        // Lấy 10 tin gần nhất (đủ ngữ cảnh, tránh dài)
+        val ctx = recentMessages.takeLast(10).joinToString("\n") { m ->
+            val who = if (m.fromId == currentUserId()) "Me" else (partnerName?.takeIf { it.isNotBlank() } ?: "Partner")
+            val text = m.text.replace("\n", " ").trim()
+            "$who: $text"
+        }.take(1800)
+
+        val last = recentMessages.lastOrNull()?.text?.trim().orEmpty()
+        if (last.isBlank()) return emptyList()
+
+        val prompt = """
+Bạn là trợ lý gợi ý trả lời tin nhắn cho app chat.
+Nhiệm vụ: Đưa ra 3 đến 5 câu trả lời ngắn (mỗi câu <= 10 từ) phù hợp NGỮ CẢNH và lịch sự.
+- Chỉ trả về danh sách câu trả lời, MỖI CÂU 1 DÒNG.
+- Không đánh số, không gạch đầu dòng, không giải thích.
+- Tránh nội dung nhạy cảm, xúc phạm, riêng tư.
+- Nếu câu hỏi cần hỏi lại: đưa 1 câu hỏi làm rõ.
+
+Ngữ cảnh (mới nhất ở cuối):
+$ctx
+
+Tin nhắn cần trả lời:
+"$last"
+""".trimIndent()
+
+        val raw = aiRepo.generatePlain(prompt)
+        // Parse: mỗi dòng là 1 suggestion
+        val lines = raw.lines()
+            .map { it.trim().trimStart('-', '•', '*', '1', '2', '3', '4', '5', '.', ')').trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+        val suggestions = lines
+            .filter { it.length in 1..80 }
+            .take(5)
+
+        return if (suggestions.isNotEmpty()) suggestions else listOf("Dạ", "OK", "Bạn nói rõ hơn giúp mình nhé")
+    }
+    suspend fun translateText(
+        text: String,
+        targetLang: String = "vi"
+    ): String {
+        val clean = text.trim()
+        if (clean.isBlank()) return clean
+
+        val prompt = """
+Hãy dịch đoạn sau sang ngôn ngữ mục tiêu: $targetLang.
+- Chỉ trả về BẢN DỊCH.
+- Không giải thích, không thêm ký tự lạ.
+- Giữ nguyên emoji, số, tên riêng, link.
+
+Văn bản:
+"$clean"
+""".trimIndent()
+
+        val out = aiRepo.generatePlain(prompt)
+        // Nếu model trả về kèm dấu ngoặc/quote thì làm sạch nhẹ
+        return out.trim().trim('"').trim()
+    }
+
 }

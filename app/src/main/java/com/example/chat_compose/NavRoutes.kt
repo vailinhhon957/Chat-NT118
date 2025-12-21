@@ -28,4 +28,9 @@ sealed class Screen(val route: String) {
     }
 
     object Settings : Screen("settings")
+    object CreateGroup : Screen("create_group")
+    object GroupCall : Screen("group_call/{callId}/{callType}") {
+        fun createRoute(callId: String, callType: String) = "group_call/$callId/$callType"
+    }
+
 }

@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CallEnd
 import androidx.compose.material.icons.rounded.Mic
@@ -37,6 +36,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import com.example.chat_compose.MainActivity
 import com.example.chat_compose.call.SensitiveContentDetector
 import com.example.chat_compose.call.WebRtcClient
@@ -63,16 +63,19 @@ fun CallScreen(
     val repo = remember { CallRepository() }
     val scope = rememberCoroutineScope()
 
-    // --- State UI ---
+    // --- UI State ---
     var realName by remember { mutableStateOf(if (partnerName.isNotBlank()) partnerName else "Đang kết nối...") }
     var avatarBytes by remember { mutableStateOf<ByteArray?>(null) }
     var status by remember { mutableStateOf("ringing") } // ringing | accepted | ended
     var startedWebRtc by remember { mutableStateOf(false) }
     var isMicOn by remember { mutableStateOf(true) }
 
+    // IMPORTANT: chặn thoát màn hình 2 lần (nguyên nhân crash/white screen)
+    var didLeaveScreen by remember { mutableStateOf(false) }
+
     // --- WebRTC ---
-    val webRtc = remember(callId) { WebRtcClient(context, repo, scope) }
     val withVideo = callType == "video"
+    val webRtc = remember(callId) { WebRtcClient(context, repo, scope) }
     val eglCtx = remember(callId, withVideo) { if (withVideo) webRtc.ensureEglContext() else null }
     var localRenderer by remember(callId) { mutableStateOf<SurfaceViewRenderer?>(null) }
     var remoteRenderer by remember(callId) { mutableStateOf<SurfaceViewRenderer?>(null) }
@@ -81,20 +84,47 @@ fun CallScreen(
     val sensitiveDetector = remember { SensitiveContentDetector() }
     var aiCheckTicker by remember { mutableLongStateOf(0L) }
 
-    // --- Logic Load Info ---
+    // --- Load partner profile ---
     LaunchedEffect(partnerId) {
         val profile = repo.getUserProfile(partnerId)
         if (profile.displayName.isNotBlank()) realName = profile.displayName
         avatarBytes = profile.avatarBytes
     }
 
-    // --- Logic Permissions ---
+    // --- Helpers: end/reject/leave an toàn ---
+    fun safeLeave() {
+        if (didLeaveScreen) return
+        didLeaveScreen = true
+        runCatching { webRtc.stop() }
+        onBack()
+    }
+
+    fun safeEndCall() {
+        // chỉ gửi ended, KHÔNG onBack ở đây (listener sẽ gọi safeLeave đúng 1 lần)
+        scope.launch { runCatching { repo.endCall(callId) } }
+    }
+
+    fun safeRejectCall() {
+        // tương tự
+        scope.launch { runCatching { repo.rejectCall(callId) } }
+    }
+
+    // --- Permissions ---
     var pendingAccept by remember { mutableStateOf(false) }
     val requiredPerms = remember(callType) {
-        if (callType == "video") arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+        if (withVideo) arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
         else arrayOf(Manifest.permission.RECORD_AUDIO)
     }
+
     var permsGranted by remember { mutableStateOf(false) }
+
+    // Auto-check permissions on enter
+    LaunchedEffect(Unit, callType) {
+        permsGranted = requiredPerms.all { perm ->
+            ContextCompat.checkSelfPermission(context, perm) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+    }
 
     val permLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -110,22 +140,25 @@ fun CallScreen(
         }
     }
 
-    // --- Logic WebRTC Setup ---
-    LaunchedEffect(localRenderer, remoteRenderer) {
+    // --- WebRTC renderers setup ---
+    LaunchedEffect(localRenderer, remoteRenderer, withVideo) {
         if (withVideo) webRtc.setVideoRenderers(localRenderer, remoteRenderer)
     }
 
+    // --- Listen call document (status) ---
     LaunchedEffect(callId) {
         repo.listenCallDoc(callId).collect { data ->
             val s = data["status"] as? String ?: return@collect
             status = s
+
             if (s == "ended") {
-                runCatching { webRtc.stop() }
-                onBack()
+                // chỉ thoát 1 lần
+                safeLeave()
             }
         }
     }
 
+    // --- Caller starts when accepted ---
     LaunchedEffect(status, permsGranted) {
         if (!permsGranted) return@LaunchedEffect
         if (startedWebRtc) return@LaunchedEffect
@@ -135,56 +168,49 @@ fun CallScreen(
         }
     }
 
-    // ==========================================================
-    // LOGIC AI: CHECK NHẠY CẢM MỖI 5 GIÂY (CHỈ KHI VIDEO CALL)
-    // ==========================================================
+    // --- AI check every 5s (video + accepted) ---
     if (status == "accepted" && withVideo) {
-        // 1. Timer loop
         LaunchedEffect(Unit) {
             while (true) {
-                delay(5000) // 5 giây check 1 lần
+                delay(5000)
                 aiCheckTicker++
             }
         }
 
-        // 2. AI Processing
         LaunchedEffect(aiCheckTicker) {
             if (aiCheckTicker > 0 && localRenderer != null) {
                 try {
                     val bitmap = captureBitmapFromSurface(localRenderer!!)
                     if (bitmap != null) {
                         val isSensitive = sensitiveDetector.isSensitive(bitmap)
-
                         if (isSensitive) {
-                            // Gọi repo để báo cáo. Hàm này (trong CallRepository) sẽ tính toán
-                            // nếu vi phạm >= 3 lần thì set lockedUntil = now + 30 ngày
                             val isLocked = repo.reportSensitiveContent()
 
                             if (isLocked) {
-                                // === XỬ LÝ KHÓA TÀI KHOẢN 30 NGÀY ===
-                                Toast.makeText(context, "BẠN ĐÃ BỊ KHÓA TÀI KHOẢN 30 NGÀY DO VI PHẠM!", Toast.LENGTH_LONG).show()
+                                Toast.makeText(
+                                    context,
+                                    "BẠN ĐÃ BỊ KHÓA TÀI KHOẢN 30 NGÀY DO VI PHẠM!",
+                                    Toast.LENGTH_LONG
+                                ).show()
 
-                                // 1. Ngắt cuộc gọi
-                                repo.endCall(callId)
-
-                                // 2. Đăng xuất khỏi Firebase (Chặn token)
+                                // chỉ endCall, thoát sẽ do listener ended
+                                runCatching { repo.endCall(callId) }
                                 FirebaseAuth.getInstance().signOut()
 
-                                // 3. Restart App về màn hình Login
                                 val intent = Intent(context, MainActivity::class.java).apply {
                                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
                                 }
                                 context.startActivity(intent)
-
                             } else {
-                                // Cảnh cáo
-                                Toast.makeText(context, "CẢNH BÁO: Hình ảnh nhạy cảm! (Vi phạm 3 lần sẽ bị khóa 30 ngày)", Toast.LENGTH_LONG).show()
+                                Toast.makeText(
+                                    context,
+                                    "CẢNH BÁO: Hình ảnh nhạy cảm! (Vi phạm 3 lần sẽ bị khóa 30 ngày)",
+                                    Toast.LENGTH_LONG
+                                ).show()
                             }
                         }
                     }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
+                } catch (_: Exception) { }
             }
         }
     }
@@ -192,6 +218,7 @@ fun CallScreen(
     // --- Cleanup ---
     DisposableEffect(Unit) {
         onDispose {
+            // cleanup không được gây crash nếu đã stop trước đó
             runCatching { webRtc.clearVideoRenderers() }
             runCatching { localRenderer?.release() }
             runCatching { remoteRenderer?.release() }
@@ -201,18 +228,17 @@ fun CallScreen(
         }
     }
 
-    // ================= UI MAIN =================
+    // ================= UI =================
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Brush.verticalGradient(listOf(Color(0xFF1F1C2C), Color(0xFF928DAB))))
             .systemBarsPadding()
     ) {
-
-        // ====== 1. VIDEO UI ======
+        // ===== VIDEO UI =====
         if (withVideo && status == "accepted") {
             Box(Modifier.fillMaxSize()) {
-                // Remote Video
+
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
@@ -226,7 +252,6 @@ fun CallScreen(
                     }
                 )
 
-                // Local Video
                 Card(
                     shape = RoundedCornerShape(16.dp),
                     modifier = Modifier
@@ -250,12 +275,15 @@ fun CallScreen(
                     )
                 }
 
-                // Controls
                 Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(0.8f))))
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Transparent, Color.Black.copy(0.8f))
+                            )
+                        )
                         .padding(bottom = 32.dp, top = 20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
@@ -282,15 +310,14 @@ fun CallScreen(
                             color = Color(0xFFFF3B30),
                             size = 72.dp
                         ) {
-                            scope.launch { repo.endCall(callId); onBack() }
+                            // CHỈ endCall, không onBack
+                            safeEndCall()
                         }
                     }
                 }
             }
-        }
-
-        // ====== 2. AUDIO / RINGING UI ======
-        else {
+        } else {
+            // ===== AUDIO / RINGING UI =====
             Column(
                 modifier = Modifier.fillMaxSize(),
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -303,7 +330,12 @@ fun CallScreen(
                 }
 
                 Spacer(Modifier.height(24.dp))
-                Text(text = realName, style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.Bold)
+                Text(
+                    text = realName,
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold
+                )
                 Spacer(Modifier.height(8.dp))
                 Text(
                     text = when (status) {
@@ -326,23 +358,35 @@ fun CallScreen(
                 }
 
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 60.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 60.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     if (status == "ringing") {
                         if (isCaller) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                ControlButton(icon = Icons.Rounded.CallEnd, color = Color(0xFFFF3B30), size = 72.dp) {
-                                    scope.launch { repo.endCall(callId); onBack() }
+                                ControlButton(
+                                    icon = Icons.Rounded.CallEnd,
+                                    color = Color(0xFFFF3B30),
+                                    size = 72.dp
+                                ) {
+                                    // CHỈ endCall, không onBack
+                                    safeEndCall()
                                 }
                                 Spacer(Modifier.height(8.dp))
                                 Text("Kết thúc", color = Color.White.copy(0.8f))
                             }
                         } else {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                ControlButton(icon = Icons.Rounded.CallEnd, color = Color(0xFFFF3B30), size = 72.dp) {
-                                    scope.launch { repo.rejectCall(callId); onBack() }
+                                ControlButton(
+                                    icon = Icons.Rounded.CallEnd,
+                                    color = Color(0xFFFF3B30),
+                                    size = 72.dp
+                                ) {
+                                    // CHỈ reject, không onBack
+                                    safeRejectCall()
                                 }
                                 Spacer(Modifier.height(8.dp))
                                 Text("Từ chối", color = Color.White.copy(0.8f))
@@ -377,19 +421,22 @@ fun CallScreen(
                             isMicOn = !isMicOn
                             webRtc.toggleAudio(isMicOn)
                         }
-                        ControlButton(icon = Icons.Rounded.CallEnd, color = Color(0xFFFF3B30), size = 72.dp) {
-                            scope.launch { repo.endCall(callId); onBack() }
+                        ControlButton(
+                            icon = Icons.Rounded.CallEnd,
+                            color = Color(0xFFFF3B30),
+                            size = 72.dp
+                        ) {
+                            // CHỈ endCall, không onBack
+                            safeEndCall()
                         }
                     } else {
-                        Button(onClick = onBack) { Text("Đóng") }
+                        Button(onClick = { safeLeave() }) { Text("Đóng") }
                     }
                 }
             }
         }
     }
 }
-
-// === COMPONENT CON & HELPER ===
 
 @Composable
 fun ControlButton(
@@ -406,7 +453,12 @@ fun ControlButton(
         colors = ButtonDefaults.buttonColors(containerColor = color),
         contentPadding = PaddingValues(0.dp)
     ) {
-        Icon(imageVector = icon, contentDescription = null, tint = iconColor, modifier = Modifier.size(size * 0.5f))
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = iconColor,
+            modifier = Modifier.size(size * 0.5f)
+        )
     }
 }
 
@@ -414,14 +466,27 @@ fun ControlButton(
 fun CallAvatar(name: String, bytes: ByteArray?, size: androidx.compose.ui.unit.Dp) {
     val initials = name.firstOrNull()?.uppercase() ?: "?"
     Box(
-        modifier = Modifier.size(size).clip(CircleShape).background(Color.Gray),
+        modifier = Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(Color.Gray),
         contentAlignment = Alignment.Center
     ) {
         if (bytes != null) {
             val bmp = remember(bytes) { android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
-            Image(bitmap = bmp.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
         } else {
-            Text(text = initials, style = MaterialTheme.typography.displayMedium, color = Color.White, fontWeight = FontWeight.Bold)
+            Text(
+                text = initials,
+                style = MaterialTheme.typography.displayMedium,
+                color = Color.White,
+                fontWeight = FontWeight.Bold
+            )
         }
     }
 }
@@ -430,14 +495,29 @@ fun CallAvatar(name: String, bytes: ByteArray?, size: androidx.compose.ui.unit.D
 fun PulseAnimation() {
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val scale by infiniteTransition.animateFloat(
-        initialValue = 1f, targetValue = 1.4f,
-        animationSpec = infiniteRepeatable(animation = tween(1500), repeatMode = RepeatMode.Restart), label = "scale"
+        initialValue = 1f,
+        targetValue = 1.4f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "scale"
     )
     val alpha by infiniteTransition.animateFloat(
-        initialValue = 0.5f, targetValue = 0f,
-        animationSpec = infiniteRepeatable(animation = tween(1500), repeatMode = RepeatMode.Restart), label = "alpha"
+        initialValue = 0.5f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "alpha"
     )
-    Box(modifier = Modifier.size(120.dp).scale(scale).background(Color.White.copy(alpha = alpha), CircleShape))
+    Box(
+        modifier = Modifier
+            .size(120.dp)
+            .scale(scale)
+            .background(Color.White.copy(alpha = alpha), CircleShape)
+    )
 }
 
 suspend fun captureBitmapFromSurface(view: SurfaceViewRenderer): Bitmap? {
@@ -449,7 +529,7 @@ suspend fun captureBitmapFromSurface(view: SurfaceViewRenderer): Bitmap? {
                 else cont.resume(null)
             }
             PixelCopy.request(view, bitmap, listener, Handler(Looper.getMainLooper()))
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             cont.resume(null)
         }
     }

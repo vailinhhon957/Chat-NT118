@@ -439,7 +439,7 @@ private fun GenderDialog(
     onDismiss: () -> Unit,
     onSelect: (String) -> Unit
 ) {
-    val options = listOf("Nam", "Nữ", "Khác")
+    val options = listOf("Nam", "Nữ")
     var selected by remember { mutableStateOf(current.ifBlank { "Khác" }) }
 
     AlertDialog(

@@ -12,7 +12,7 @@ class SensitiveContentDetector {
     // Các từ khóa nghi ngờ nhạy cảm (Bạn có thể thêm tùy chỉnh)
     private val sensitiveKeywords = listOf(
         "Swimwear", "Undergarment", "Brassiere", "Underpants", "Bikini",
-        "Lingerie", "Barechested", "Trunk","Smile" // Trunk: thân mình trần
+        "Lingerie", "Barechested", "Trunk" // Trunk: thân mình trần
     )
 
     private val labeler = ImageLabeling.getClient(ImageLabelerOptions.DEFAULT_OPTIONS)

@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.Chatcompose" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- Theme chính của app: BẮT BUỘC là Theme.MaterialComponents (hoặc con của nó) để Zego không crash -->
+    <style name="Theme.Chatcompose" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- Tuỳ chọn: giữ màu tối cho thanh điều hướng / status -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+
+        <!-- Tuỳ chọn: chữ/icon sáng trên status bar (nếu bạn dùng nền tối nhiều) -->
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
 </resources>

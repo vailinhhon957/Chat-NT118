@@ -92,4 +92,6 @@ dependencies {
     implementation("com.google.mlkit:image-labeling:17.0.7")
     implementation("com.google.mlkit:smart-reply:17.0.4")
     implementation("com.google.android.gms:play-services-auth:20.7.0")
+    implementation("com.github.ZEGOCLOUD:zego_uikit_prebuilt_call_android:+")
+    implementation("com.google.android.material:material:1.12.0")
 }

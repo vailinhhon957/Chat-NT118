@@ -33,7 +33,7 @@ class GeminiAiRepository {
                 - Trả lời ngắn gọn, rõ ràng, ưu tiên gạch đầu dòng.
                 - Nếu câu hỏi có thể dài: tóm tắt trước, rồi trả lời.
                 - Nếu là ảnh: mô tả hoặc trả lời câu hỏi về ảnh.
-                - Nếu là âm thanh: tóm tắt hoặc trả lời nội dung âm thanh.
+                - Nếu là âm thanh: trả lời nội dung âm thanh.
                 """.trimIndent()
             )
         }
@@ -153,6 +153,15 @@ class GeminiAiRepository {
         } catch (e: Exception) {
             e.printStackTrace()
             "NEUTRAL"
+        }
+    }
+    suspend fun generatePlain(prompt: String): String {
+        return try {
+            val response = model.generateContent(prompt)
+            response.text?.trim().orEmpty()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            "Lỗi AI: ${e.localizedMessage}"
         }
     }
 }

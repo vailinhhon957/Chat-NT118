@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.GroupAdd
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -41,7 +42,6 @@ import com.example.chat_compose.push.RequestNotificationPermissionOnce
 import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.launch
 
-// --- MÀU SẮC CHỦ ĐẠO (DARK THEME) ---
 private val DarkBackground = Color(0xFF121212)
 private val CardBackground = Color(0xFF1E1E24)
 private val PrimaryAccent = Color(0xFF6C63FF)
@@ -55,7 +55,8 @@ fun HomeScreen(
     friends: List<ChatUser>,
     onOpenChat: (String) -> Unit,
     onLogout: () -> Unit, // giữ để không lỗi chỗ gọi
-    onOpenSettings: () -> Unit = {}
+    onOpenSettings: () -> Unit = {},
+    onCreateGroup: () -> Unit = {} // ✅ MỚI
 ) {
     val currentUser = FirebaseAuth.getInstance().currentUser
     RequestNotificationPermissionOnce()
@@ -124,13 +125,26 @@ fun HomeScreen(
                     Text(text = username, color = TextPrimary, fontSize = 24.sp, fontWeight = FontWeight.Bold)
                 }
 
-                IconButton(
-                    onClick = onOpenSettings,
-                    modifier = Modifier
-                        .background(CardBackground, CircleShape)
-                        .border(1.dp, Color.White.copy(0.1f), CircleShape)
-                ) {
-                    Icon(Icons.Default.Settings, null, tint = TextPrimary)
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    // ✅ Nút tạo nhóm
+                    IconButton(
+                        onClick = onCreateGroup,
+                        modifier = Modifier
+                            .background(CardBackground, CircleShape)
+                            .border(1.dp, Color.White.copy(0.1f), CircleShape)
+                    ) {
+                        Icon(Icons.Default.GroupAdd, null, tint = TextPrimary)
+                    }
+
+                    // Settings
+                    IconButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier
+                            .background(CardBackground, CircleShape)
+                            .border(1.dp, Color.White.copy(0.1f), CircleShape)
+                    ) {
+                        Icon(Icons.Default.Settings, null, tint = TextPrimary)
+                    }
                 }
             }
         }
@@ -204,7 +218,6 @@ fun HomeScreen(
     }
 }
 
-// --- ITEM CHAT ---
 @Composable
 private fun ChatCardItem(
     user: ChatUser,
@@ -230,10 +243,8 @@ private fun ChatCardItem(
             modifier = Modifier.padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // --- AVATAR ---
             Box {
                 if (isBot) {
-                    // ✅ Avatar chatbot từ drawable
                     Image(
                         painter = painterResource(id = R.drawable.ic_ai_bot),
                         contentDescription = "Bot avatar",
@@ -268,7 +279,6 @@ private fun ChatCardItem(
 
             Spacer(Modifier.width(16.dp))
 
-            // --- TEXT CONTENT ---
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(

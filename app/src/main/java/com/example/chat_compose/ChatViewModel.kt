@@ -10,13 +10,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.chat_compose.data.AudioRecorder
 import com.example.chat_compose.data.ChatRepository
+import com.example.chat_compose.data.GeminiAiRepository
 import com.example.chat_compose.model.ChatUser
 import com.example.chat_compose.model.Message
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
-import com.example.chat_compose.data.GeminiAiRepository
 
 class ChatViewModel(
     private val repo: ChatRepository = ChatRepository()
@@ -37,11 +38,32 @@ class ChatViewModel(
             }
         }
     }
-    var isEphemeralMode by mutableStateOf(false) // Mặc định tắt
+
+    // ================== GROUP: CREATE ==================
+    fun createGroup(
+        name: String,
+        memberIds: List<String>,
+        onSuccess: (String) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        viewModelScope.launch {
+            val res = repo.createGroup(name = name, memberIds = memberIds)
+            if (res.isSuccess) {
+                onSuccess(res.getOrThrow())
+            } else {
+                onError(res.exceptionOrNull()?.message ?: "Tạo nhóm thất bại")
+            }
+        }
+    }
+
+    // ================== Ephemeral ==================
+    var isEphemeralMode by mutableStateOf(false)
         private set
+
     fun toggleEphemeralMode() {
         isEphemeralMode = !isEphemeralMode
     }
+
     // ================== 2. CHAT STATE ==================
     var messages by mutableStateOf<List<Message>>(emptyList())
         private set
@@ -66,6 +88,37 @@ class ChatViewModel(
                 partnerUser = user
                 maybeGenerateSmartRepliesIfNeeded(uid)
             }
+        }
+    }
+
+    // ================== [NEW] CACHE USERNAME FOR GROUP ==================
+    private val userCache = mutableStateMapOf<String, ChatUser>()
+    private val userCacheJobs = mutableStateMapOf<String, Job>()
+
+    /**
+     * Prefetch thông tin user để hiển thị "tên người gửi" trong group chat.
+     * Gọi nhiều lần cũng OK vì đã cache + chặn job trùng.
+     */
+    fun ensureUserCached(uid: String) {
+        if (uid.isBlank()) return
+        if (userCache.containsKey(uid)) return
+        if (userCacheJobs[uid]?.isActive == true) return
+
+        userCacheJobs[uid] = viewModelScope.launch {
+            runCatching {
+                // Lấy 1 lần là đủ
+                val u = repo.listenUser(uid).first()
+                if (u != null) userCache[uid] = u
+            }
+        }
+    }
+
+    fun displayNameOf(uid: String): String? {
+        val u = userCache[uid] ?: return null
+        return when {
+            u.displayName.isNotBlank() -> u.displayName
+            u.email.isNotBlank() -> u.email.substringBefore("@")
+            else -> null
         }
     }
 
@@ -118,6 +171,18 @@ class ChatViewModel(
         msgJob = viewModelScope.launch {
             repo.listenMessages(partnerId).collect { list ->
                 messages = list
+
+                // [NEW] Nếu là group chat: cache tên người gửi cho các message incoming
+                val myId = repo.currentUserId()
+                val isGroup = partnerId.startsWith(ChatRepository.GROUP_ID_PREFIX)
+                if (isGroup) {
+                    list.asSequence()
+                        .map { it.fromId }
+                        .filter { it.isNotBlank() && it != myId }
+                        .distinct()
+                        .forEach { ensureUserCached(it) }
+                }
+
                 if (messages.isNotEmpty()) {
                     maybeGenerateSmartRepliesIfNeeded(partnerId)
                 } else {
@@ -153,6 +218,7 @@ class ChatViewModel(
             replyingTo = null
         }
     }
+
     fun deleteMessage(partnerId: String, msgId: String) {
         viewModelScope.launch {
             repo.deleteMessage(partnerId, msgId)
@@ -183,7 +249,6 @@ class ChatViewModel(
     }
 
     fun attachVoiceFile(file: File) {
-        // xoá file cũ nếu có để tránh rác
         try { pendingVoiceFile?.delete() } catch (_: Exception) {}
         pendingVoiceFile = file
     }
@@ -198,10 +263,6 @@ class ChatViewModel(
         clearPendingVoice()
     }
 
-    /**
-     * Gửi bundle: text (nếu có) + voice (nếu có) + nhiều ảnh (nếu có).
-     * (Mỗi item sẽ là 1 message riêng; không đổi schema Firestore.)
-     */
     fun sendBundle(partnerId: String, text: String) {
         val t = text.trim()
         val hasAnything = t.isNotBlank() || pendingVoiceFile != null || pendingImages.isNotEmpty()
@@ -218,7 +279,6 @@ class ChatViewModel(
                 } else null
             }
 
-            // 1) text
             if (t.isNotBlank()) {
                 val r = takeReplyOnce()
                 if (partnerId == ChatRepository.AI_BOT_ID) {
@@ -228,15 +288,12 @@ class ChatViewModel(
                 }
             }
 
-            // 2) voice (đính kèm)
             pendingVoiceFile?.let { f ->
+                @Suppress("UNUSED_VARIABLE")
                 val r = takeReplyOnce()
-                // repo.sendVoiceMessage không nhận replyingTo, nên reply chỉ áp dụng cho phần text/ảnh
-                // (Nếu bạn muốn reply cho voice thì phải mở rộng schema message)
                 repo.sendVoiceMessage(partnerId, f)
             }
 
-            // 3) nhiều ảnh
             if (pendingImages.isNotEmpty()) {
                 pendingImages.forEachIndexed { idx, bytes ->
                     val r = if (idx == 0) takeReplyOnce() else null
@@ -244,7 +301,6 @@ class ChatViewModel(
                 }
             }
 
-            // clear state
             replyingTo = null
             smartSuggestions.clear()
             isSmartReplyLoading = false
@@ -269,10 +325,6 @@ class ChatViewModel(
         audioRecorder?.startRecording()
     }
 
-    /**
-     * Dừng ghi âm và GẮN vào pending (không gửi ngay).
-     * Người dùng sẽ bấm Send để gửi chung với ảnh/text.
-     */
     fun stopAndAttachRecording() {
         isRecording = false
         val file = audioRecorder?.stopRecording()
@@ -281,7 +333,6 @@ class ChatViewModel(
         }
     }
 
-    // (Giữ lại để không vỡ chỗ nào khác nếu còn gọi)
     fun stopAndSendRecording(partnerId: String) {
         isRecording = false
         val file = audioRecorder?.stopRecording()
@@ -307,26 +358,27 @@ class ChatViewModel(
     var isPartnerTyping by mutableStateOf(false)
         private set
 
-    private var typingJob: Job? = null
+    private var typingObserveJob: Job? = null
+    private var typingDelayJob: Job? = null
 
     fun observeTyping(partnerId: String) {
-        viewModelScope.launch {
-            repo.listenPartnerTyping(partnerId).collect {
-                isPartnerTyping = it
+        typingObserveJob?.cancel()
+        typingObserveJob = viewModelScope.launch {
+            repo.listenPartnerTyping(partnerId).collect { isTyping ->
+                isPartnerTyping = isTyping
             }
         }
     }
 
     fun onInputTextChanged(partnerId: String, newText: String) {
-        if (newText.isNotBlank() && typingJob == null) {
+        if (newText.isNotBlank()) {
             viewModelScope.launch { repo.setTyping(partnerId, true) }
         }
 
-        typingJob?.cancel()
-        typingJob = viewModelScope.launch {
+        typingDelayJob?.cancel()
+        typingDelayJob = viewModelScope.launch {
             delay(2000)
             repo.setTyping(partnerId, false)
-            typingJob = null
         }
     }
 
@@ -336,23 +388,19 @@ class ChatViewModel(
         }
     }
 
+    // ================== 9. SENTIMENT ==================
     var currentSentiment by mutableStateOf("NEUTRAL")
         private set
+
     private val aiRepo = GeminiAiRepository()
+
     fun analyzeLastMessageSentiment() {
         viewModelScope.launch {
-            // Lấy tin nhắn cuối cùng
             val lastMsg = messages.lastOrNull() ?: return@launch
-
-            // Chỉ phân tích nếu là tin nhắn của ĐỐI PHƯƠNG (Partner)
-            // Vì mình muốn giao diện phản ứng theo cảm xúc của họ
             val myId = repo.currentUserId()
+
             if (lastMsg.fromId != myId && lastMsg.text.isNotBlank()) {
-
-                // Gọi AI (Giả sử bạn đã khởi tạo aiRepo trong ViewModel)
                 val sentiment = aiRepo.analyzeSentiment(lastMsg.text)
-
-                // Cập nhật UI
                 if (sentiment in listOf("HAPPY", "SAD", "ANGRY", "LOVE", "NEUTRAL")) {
                     currentSentiment = sentiment
                 }

@@ -1,6 +1,8 @@
 package com.example.chat_compose.data
 
+import android.util.Base64
 import android.util.Log
+import com.example.chat_compose.data.ChatRepository
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
@@ -10,19 +12,20 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
 import org.webrtc.IceCandidate
-import android.util.Base64
-import com.example.chat_compose.data.ChatRepository
 import java.util.Date
+
 data class IncomingCall(
     val id: String = "",
     val callerId: String = "",
     val calleeId: String = "",
     val callType: String = "audio" // "audio" | "video"
 )
+
 data class SimpleUserProfile(
     val displayName: String = "",
     val avatarBytes: ByteArray? = null
 )
+
 class CallRepository(
     private val auth: FirebaseAuth = FirebaseAuth.getInstance(),
     private val db: FirebaseFirestore = FirebaseFirestore.getInstance()
@@ -36,9 +39,8 @@ class CallRepository(
 
     fun currentUid(): String? = auth.currentUser?.uid
     private fun callsCol() = db.collection("calls")
-
-    // ===== CREATE OUTGOING CALL =====
-    // ===== CREATE OUTGOING CALL =====
+    private fun groupCallsCol() = db.collection("group_calls")
+    // ===== CREATE OUTGOING CALL (1-1) =====
     suspend fun startOutgoingCall(partnerUid: String, callType: String = "audio"): String {
         val myUid = currentUid() ?: throw IllegalStateException("Not logged in")
 
@@ -62,14 +64,15 @@ class CallRepository(
             val name = doc.getString("displayName") ?: "Người dùng"
             val avatarBase64 = doc.getString("avatarBase64")
             val bytes = avatarBase64?.let {
-                try { Base64.decode(it, Base64.DEFAULT) } catch (e: Exception) { null }
+                try { Base64.decode(it, Base64.DEFAULT) } catch (_: Exception) { null }
             }
             SimpleUserProfile(name, bytes)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             SimpleUserProfile("Người dùng", null)
         }
     }
-    // ===== INCOMING LISTEN (for MainActivity) =====
+
+    // ===== INCOMING LISTEN (1-1) =====
     fun listenIncomingCallsForUser(myUid: String): Flow<IncomingCall?> = callbackFlow {
         var lastSentId: String? = null
 
@@ -120,7 +123,6 @@ class CallRepository(
         awaitClose { reg.remove() }
     }
 
-    // ===== STATUS =====
     private suspend fun setStatus(callId: String, status: String) {
         callsCol().document(callId).update(
             mapOf(
@@ -222,23 +224,29 @@ class CallRepository(
         }
         awaitClose { reg.remove() }
     }
+
+    // ===== CALL LOG: FIX để group dùng chatId = groupId =====
     suspend fun sendCallLogToChat(
         partnerId: String,
-        callType: String, // "audio" hoặc "video"
-        statusMessage: String // Ví dụ: "Đã kết thúc", "Từ chối"
+        callType: String,      // "audio" hoặc "video"
+        statusMessage: String  // "Đã kết thúc", "Từ chối", ...
     ) {
         val myUid = currentUid() ?: return
 
-        // Tạo Chat ID (Logic này phải giống hệt bên ChatRepository)
-        // Để đảm bảo tin nhắn chui vào đúng box chat của 2 người
-        val chatId = if (myUid < partnerId) "${myUid}_$partnerId" else "${partnerId}_$myUid"
+        val isGroup = partnerId.startsWith(ChatRepository.GROUP_ID_PREFIX)
+
+        // Group: chatId = groupId
+        // 1-1: chatId = uid_uid
+        val chatId = if (isGroup) {
+            partnerId
+        } else {
+            if (myUid < partnerId) "${myUid}_$partnerId" else "${partnerId}_$myUid"
+        }
 
         val msgDoc = db.collection("chats").document(chatId).collection("messages").document()
 
-        // Chọn icon tùy loại cuộc gọi
         val icon = if (callType == "video") "📹" else "📞"
         val displayType = if (callType == "video") "Video Call" else "Audio Call"
-
         val textContent = "$icon $displayType - $statusMessage"
 
         val data = hashMapOf(
@@ -252,7 +260,7 @@ class CallRepository(
             "imageBase64" to null,
             "audioUrl" to null,
             "reactions" to emptyMap<String, String>(),
-            "status" to "SENT" // Quan trọng để khớp với model Message mới
+            "status" to "SENT"
         )
 
         try {
@@ -261,6 +269,7 @@ class CallRepository(
             Log.e("CallRepo", "Failed to write call log", e)
         }
     }
+
     suspend fun reportSensitiveContent(): Boolean {
         val myUid = currentUid() ?: return false
         val userRef = db.collection("users").document(myUid)
@@ -274,21 +283,13 @@ class CallRepository(
 
                 transaction.update(userRef, "violationCount", newCount)
 
-                // Nếu vi phạm >= 3 lần -> Khóa 30 ngày
                 if (newCount >= 3) {
-                    // Tính 30 ngày ra mili-giây
                     val thirtyDaysInMs = 30L * 24 * 60 * 60 * 1000
                     val unlockTime = System.currentTimeMillis() + thirtyDaysInMs
-
-                    // Lưu thời điểm được mở khóa
                     transaction.update(userRef, "lockedUntil", unlockTime)
-
-                    // (Tùy chọn) Reset số lần vi phạm về 0 để sau 30 ngày tính lại từ đầu
-                    // transaction.update(userRef, "violationCount", 0)
-
-                    return@runTransaction true // BỊ KHÓA
+                    return@runTransaction true
                 }
-                return@runTransaction false // CHƯA BỊ KHÓA
+                return@runTransaction false
             }.await()
         } catch (e: Exception) {
             e.printStackTrace()
@@ -296,8 +297,6 @@ class CallRepository(
         }
     }
 
-    // === 2. HÀM KIỂM TRA CẤM ĐĂNG NHẬP (Dùng ở màn hình Login) ===
-    // Trả về: Null nếu không bị cấm, hoặc String chứa ngày mở khóa nếu đang bị cấm
     suspend fun checkBanStatus(uid: String): String? {
         return try {
             val doc = db.collection("users").document(uid).get().await()
@@ -305,16 +304,54 @@ class CallRepository(
             val now = System.currentTimeMillis()
 
             if (lockedUntil > now) {
-                // Vẫn đang trong thời gian cấm
                 val date = Date(lockedUntil)
                 val format = java.text.SimpleDateFormat("dd/MM/yyyy HH:mm", java.util.Locale.getDefault())
-                return format.format(date) // Trả về ngày được mở
-            } else {
-                // Đã hết hạn cấm hoặc chưa từng bị cấm
-                return null
-            }
-        } catch (e: Exception) {
+                format.format(date)
+            } else null
+        } catch (_: Exception) {
             null
         }
+    }
+    data class GroupCallSession(
+        val roomId: String = "",
+        val callType: String = "audio",
+        val status: String = "active", // active | ended
+        val startedBy: String = "",
+        val startedAt: com.google.firebase.Timestamp? = null,
+        val endedAt: com.google.firebase.Timestamp? = null
+    )
+
+    suspend fun startGroupCallSession(roomId: String, callType: String, starterId: String) {
+        val doc = groupCallsCol().document(roomId)
+        val payload = mapOf(
+            "roomId" to roomId,
+            "callType" to callType,
+            "status" to "active",
+            "startedBy" to starterId,
+            "startedAt" to com.google.firebase.Timestamp.now(),
+            "endedAt" to null
+        )
+        doc.set(payload).await()
+    }
+
+    suspend fun endGroupCallSession(roomId: String) {
+        groupCallsCol().document(roomId).update(
+            mapOf(
+                "status" to "ended",
+                "endedAt" to com.google.firebase.Timestamp.now()
+            )
+        ).await()
+    }
+
+    fun listenGroupCallSession(roomId: String) = kotlinx.coroutines.flow.callbackFlow<GroupCallSession?> {
+        val reg = groupCallsCol().document(roomId).addSnapshotListener { snap, _ ->
+            if (snap == null || !snap.exists()) {
+                trySend(null)
+                return@addSnapshotListener
+            }
+            val s = snap.toObject(GroupCallSession::class.java)
+            trySend(s)
+        }
+        awaitClose { reg.remove() }
     }
 }
